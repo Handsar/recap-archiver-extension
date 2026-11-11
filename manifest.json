@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "纪要一键归档 · Recap Archiver",
+  "version": "1.0.1",
+  "description": "一键把 AI 录音笔分享页或任意网页完整保存到本地：内容 HTML 原件 + 结构化 Markdown + 元信息，打包为单个 ZIP。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://r.qq.com/*",
+    "https://download.z.weixin.qq.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "一键归档当前页面",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

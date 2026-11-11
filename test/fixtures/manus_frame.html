@@ -1,0 +1,813 @@
+<!DOCTYPE html><html lang="zh-CN" data-recap-state="ok"><head><script>(function () {
+  var RESIZE = 'voice-recorder:resize';
+  var MEASURE = 'voice-recorder:measure';
+  var SCROLL = 'voice-recorder:scroll';
+  var STATE_ATTRIBUTE = 'data-recap-state';
+  var DEFAULT_STATE = 'ok';
+  var MEASURE_FALLBACK_DELAY = 120;
+  var pending = false;
+  var pendingTimer = null;
+  var lastHeight = 0;
+  var lastBackgroundColor;
+  var raf = window.requestAnimationFrame
+    || window.webkitRequestAnimationFrame
+    || function (callback) { return setTimeout(callback, 16); };
+
+  function readState() {
+    try {
+      return document.documentElement.getAttribute(STATE_ATTRIBUTE) || DEFAULT_STATE;
+    } catch (error) {
+      return DEFAULT_STATE;
+    }
+  }
+
+  function isBlankColor(color) {
+    return !color || color === 'transparent' || /^rgba\([^)]*,\s*0\s*\)$/.test(color);
+  }
+
+  function readBackgroundColor() {
+    try {
+      var elements = [document.body, document.documentElement];
+      for (var i = 0; i < elements.length; i += 1) {
+        if (!elements[i]) continue;
+        var color = getComputedStyle(elements[i]).backgroundColor;
+        if (isBlankColor(color)) continue;
+        // 半透明色无法直接作为外层底色，交给现有主题默认色兜底。
+        if (/^rgba\(/.test(color) && !/,\s*1\s*\)$/.test(color)) return '';
+        return color;
+      }
+    } catch (error) {
+      // 取色失败不影响高度同步。
+    }
+    return '';
+  }
+
+  function measure() {
+    pending = false;
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    var body = document.body;
+    if (!body) return;
+    var style = getComputedStyle(body);
+    var height = Math.ceil(Math.max(body.scrollHeight, body.offsetHeight)
+      + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0));
+    var backgroundColor = readBackgroundColor();
+    if (height <= 0 || (height === lastHeight && backgroundColor === lastBackgroundColor)) return;
+    lastHeight = height;
+    lastBackgroundColor = backgroundColor;
+    window.parent.postMessage({
+      type: RESIZE,
+      height: height,
+      backgroundColor: backgroundColor,
+      state: readState(),
+    }, '*');
+  }
+
+  function reportHeight() {
+    if (pending) return;
+    pending = true;
+    // rAF 在后台标签或被节流时可能长期不触发，用定时器兜底解锁，避免闩锁永久卡住。
+    pendingTimer = setTimeout(measure, MEASURE_FALLBACK_DELAY);
+    raf(measure);
+  }
+
+  window.addEventListener('message', function (event) {
+    if (event.source !== window.parent || !event.data || event.data.type !== MEASURE) return;
+    lastHeight = 0;
+    reportHeight();
+  });
+
+  function scrollToAnchor(hash) {
+    if (window.parent === window || !hash || hash.charAt(0) !== '#') return;
+    // 保留原生导航，直接读取浏览器选中的目标；ID 编码、旧式 name 和 :target 语义均由浏览器处理。
+    var target = document.querySelector(':target');
+    if (!target) {
+      var name = hash.slice(1);
+      try { name = decodeURIComponent(name); } catch (error) { /* 保留非标准编码的 ID。 */ }
+      if (name && name.toLowerCase() !== 'top') return;
+    }
+    if (target && !target.getClientRects().length) return;
+    // :target 或正文 hashchange 处理可能展开内容，先同步高度，避免父页按旧高度截断坐标。
+    measure();
+    // 使用正文文档坐标：原生导航可能先滚动旧尺寸的 iframe，全文扩高后内部滚动会归零。
+    var top = target ? target.getBoundingClientRect().top + (window.pageYOffset || 0) : 0;
+    if (target) top -= parseFloat(getComputedStyle(target).scrollMarginTop) || 0;
+    if (!isFinite(top)) return;
+    window.parent.postMessage({ type: SCROLL, top: Math.max(0, top) }, '*');
+  }
+
+  if (document.addEventListener) {
+    document.addEventListener('click', function (event) {
+      if (event.defaultPrevented || event.button !== 0
+        || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      var link = event.target;
+      while (link && (!link.tagName || link.tagName.toLowerCase() !== 'a')) link = link.parentNode;
+      if (!link || window.parent === window) return;
+      var previousURL = window.location.href;
+      // 捕获阶段只观察。等正文的 document/window 委托及默认动作完成后再检查是否被取消。
+      setTimeout(function () {
+        if (event.defaultPrevented || window.location.href !== previousURL || link.hasAttribute('download')) return;
+        var base = document.querySelector('base[target]');
+        var target = link.getAttribute('target') || (base && base.getAttribute('target'));
+        if (target && target.toLowerCase() !== '_self') return;
+        var href = link.href;
+        if (typeof href !== 'string' || href !== previousURL) return;
+        var separator = href.indexOf('#');
+        // 只补同一 URL 的重复点击；新的 fragment 由原生导航和 hashchange 处理。
+        if (separator >= 0) scrollToAnchor(href.slice(separator));
+      }, 0);
+    }, true);
+  }
+  window.addEventListener('hashchange', function () {
+    var href = window.location.href;
+    setTimeout(function () {
+      if (window.location.href !== href) return;
+      var separator = href.indexOf('#');
+      // location.hash 无法区分没有 fragment 和空 #；前者保留浏览器的历史位置恢复。
+      if (separator >= 0) scrollToAnchor(href.slice(separator));
+    }, 0);
+  });
+
+  function watchImages() {
+    var images = document.images || [];
+    for (var i = 0; i < images.length; i += 1) {
+      if (images[i].complete || !images[i].addEventListener) continue;
+      images[i].addEventListener('load', reportHeight);
+      images[i].addEventListener('error', reportHeight);
+    }
+  }
+
+  function observe() {
+    if (window.ResizeObserver) {
+      var sizeObserver = new ResizeObserver(reportHeight);
+      sizeObserver.observe(document.documentElement);
+      if (document.body) sizeObserver.observe(document.body);
+    }
+    if (window.MutationObserver) {
+      // 子树变化也要观察：未标注宽高的图片和异步样式都会改变正文高度。
+      new MutationObserver(reportHeight).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme'],
+        childList: true,
+        subtree: true,
+      });
+    }
+    if (window.matchMedia) {
+      var theme = window.matchMedia('(prefers-color-scheme: dark)');
+      if (theme.addEventListener) theme.addEventListener('change', reportHeight);
+      else if (theme.addListener) theme.addListener(reportHeight);
+    }
+    watchImages();
+    reportHeight();
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(reportHeight);
+    }
+  }
+
+  if (document.readyState === 'loading' && document.addEventListener) {
+    document.addEventListener('DOMContentLoaded', observe);
+  } else {
+    observe();
+  }
+  window.addEventListener('load', reportHeight);
+  window.addEventListener('resize', reportHeight);
+})();</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="content-status" content="substantive">
+<meta name="artifact-kind" content="doc">
+<title>超级团队落地：Manus 的可插拔实践</title>
+<style>
+:root{
+  --page-bg:#f6f7f9;
+  --surface:#ffffff;
+  --surface-2:#eff1f6;
+  --text:#1b2130;
+  --muted:#5c6474;
+  --accent:#4f46e5;
+  --accent-soft:#edeffd;
+  --accent-border:#d9dcf8;
+  --on-accent:#ffffff;
+  --border:#e3e6ec;
+  --warn:#b45309;
+  --warn-soft:#fdf1dc;
+  --radius:14px;
+  --font:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI","Microsoft YaHei",sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --page-bg:#101318;
+    --surface:#171b23;
+    --surface-2:#1c212c;
+    --text:#e7eaf1;
+    --muted:#a3abb9;
+    --accent:#8f97ff;
+    --accent-soft:#232844;
+    --accent-border:#3b4268;
+    --on-accent:#14172a;
+    --border:#2a3140;
+    --warn:#e8a33d;
+    --warn-soft:#37301a;
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{color-scheme:light dark}
+body{background:var(--page-bg);color:var(--text);font-family:var(--font);font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:30px 18px 70px}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- header ---- */
+.hero{padding:6px 0 26px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.kicker{font-size:12px;font-weight:700;letter-spacing:.14em;color:var(--accent)}
+h1{font-size:clamp(24px,5.6vw,34px);line-height:1.28;font-weight:800;margin:10px 0 12px;letter-spacing:.01em}
+.hero p{color:var(--muted);font-size:14px;max-width:660px}
+
+/* ---- part ---- */
+.part{display:flex;align-items:center;gap:12px;margin:42px 0 16px}
+.pnum{font-size:11px;font-weight:800;letter-spacing:.12em;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-border);padding:3px 10px;border-radius:99px;white-space:nowrap}
+.part h2{font-size:18px;font-weight:800;line-height:1.35}
+.part .rule{flex:1;height:1px;background:var(--border);min-width:20px}
+
+/* ---- lead / card ---- */
+.lead{border-left:3px solid var(--accent);padding:4px 2px 4px 14px;color:var(--muted);font-size:13.8px;margin:0 2px 18px;max-width:740px}
+.lead b{color:var(--text);font-weight:600}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 18px;margin-bottom:16px}
+@media(min-width:720px){.card{padding:24px 26px}}
+.card h3{font-size:16.5px;font-weight:800;margin-bottom:10px;display:flex;align-items:center;gap:9px;line-height:1.4}
+.card h3::before{content:"";width:4px;height:16px;border-radius:2px;background:var(--accent);flex-shrink:0}
+.card p{margin:8px 0}
+p.note{font-size:13px;color:var(--muted)}
+em.hl{font-style:normal;color:var(--accent);font-weight:600}
+ul.ticks{list-style:none;margin:12px 0 4px}
+ul.ticks li{position:relative;padding-left:16px;margin:8px 0}
+ul.ticks li::before{content:"";position:absolute;left:2px;top:.66em;width:6px;height:6px;border-radius:2px;background:var(--accent);opacity:.5}
+.insight{margin-top:14px;padding:10px 14px;background:var(--surface-2);border-left:3px solid var(--accent);border-radius:0 10px 10px 0;font-size:13.2px;color:var(--text)}
+.insight .tag{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--accent);margin-right:7px;white-space:nowrap}
+
+/* ---- figure ---- */
+figure.fig{margin:14px 0 6px;background:var(--surface-2);border:1px solid var(--border);border-radius:12px;padding:14px 14px 16px}
+@media(min-width:720px){figure.fig{padding:18px 20px}}
+figure.fig figcaption{font-size:12.5px;font-weight:600;color:var(--muted);margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fig-tag{font-size:10.5px;font-weight:800;letter-spacing:.08em;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-border);padding:1px 8px;border-radius:99px;white-space:nowrap}
+.fignote{font-size:12.3px;color:var(--muted);margin-top:10px}
+
+/* ---- chips ---- */
+.chip.mini{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:99px;background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent-border);margin:2px 5px 0 0}
+.chip.mini.plain{background:var(--surface);color:var(--muted);border-color:var(--border)}
+
+/* ---- infra framework ---- */
+.infra{display:flex;flex-direction:column;gap:9px}
+.irow{display:flex;gap:12px;align-items:flex-start;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:11px 13px}
+.inum{width:26px;height:26px;border-radius:8px;background:var(--accent-soft);color:var(--accent);font-weight:800;font-size:12.5px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px}
+.iname{font-weight:800;font-size:14px;margin-bottom:2px}
+.idesc{font-size:12.8px;color:var(--muted);line-height:1.75}
+.idesc .arr{color:var(--accent);font-weight:800;margin:0 3px}
+
+/* ---- flow ---- */
+.flow{display:flex;flex-direction:column;gap:12px}
+.fstep{position:relative;display:flex;gap:10px;align-items:flex-start;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;min-width:0}
+.fnum{min-width:22px;height:22px;padding:0 5px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px}
+.fstep b{display:block;font-size:13.5px;line-height:1.5}
+.fsub{display:block;font-size:12.2px;color:var(--muted);line-height:1.6}
+.flow.v .fstep:not(:last-child)::after{content:"";position:absolute;left:22px;top:calc(100% + 1px);height:10px;width:2px;background:var(--accent-border)}
+.flow.h{gap:16px}
+.flow.h .fstep:not(:last-child)::after{content:"↓";position:absolute;left:50%;bottom:-14px;transform:translateX(-50%);color:var(--accent);font-weight:800;font-size:13px;line-height:1}
+@media(min-width:720px){
+  .flow.h{flex-direction:row;align-items:stretch}
+  .flow.h .fstep{flex:1}
+  .flow.h .fstep:not(:last-child)::after{content:"→";left:auto;right:-14px;bottom:auto;top:50%;transform:translateY(-50%)}
+}
+.fbranch{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:430px){.fbranch{grid-template-columns:1fr}}
+
+/* ---- duo panels ---- */
+.duo{display:grid;grid-template-columns:1fr;gap:10px}
+@media(min-width:620px){.duo{grid-template-columns:1fr 1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:12px 14px;min-width:0}
+.p-t{font-weight:800;font-size:13.5px}
+.p-s{font-size:11.5px;color:var(--muted);margin:2px 0 8px}
+ul.mini{list-style:none}
+ul.mini li{position:relative;padding-left:12px;font-size:12.6px;color:var(--muted);margin:5px 0;line-height:1.6}
+ul.mini li::before{content:"";position:absolute;left:0;top:.62em;width:4px;height:4px;border-radius:50%;background:var(--muted);opacity:.6}
+ul.mini li b{color:var(--text);font-weight:600}
+
+/* ---- matrix ---- */
+.mx{display:flex;flex-direction:column;gap:9px}
+.mx-row{display:grid;grid-template-columns:1fr;gap:8px}
+@media(min-width:640px){.mx-row{grid-template-columns:1fr 1fr}}
+.mcell{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:12.6px;color:var(--text);line-height:1.65;min-width:0}
+.mcell i{display:inline-block;font-style:normal;font-size:10.5px;font-weight:800;letter-spacing:.06em;padding:1px 8px;border-radius:99px;margin-bottom:5px}
+.mx-a i{color:var(--warn);background:var(--warn-soft)}
+.mx-b i{color:var(--accent);background:var(--accent-soft)}
+.mx-b{border-color:var(--accent-border)}
+
+/* ---- mono stack ---- */
+.stack{display:flex;flex-direction:column;gap:7px}
+.slayer{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:11px 14px;min-width:0}
+.slayer b{display:block;font-size:13.5px;margin-bottom:2px}
+.slayer span{font-size:12.2px;color:var(--muted);line-height:1.65;display:block}
+.s-base{background:var(--accent-soft);border-color:var(--accent-border)}
+.sarrow{display:flex;justify-content:center;font-size:11.5px;font-weight:700;color:var(--accent);letter-spacing:.03em}
+
+/* ---- plugin widget ---- */
+.pd{display:flex;flex-direction:column;gap:11px}
+.pd-kernel{background:var(--accent);color:var(--on-accent);border-radius:12px;padding:12px 16px;font-weight:800;font-size:14px;display:flex;align-items:center;gap:10px}
+.pd-led{width:8px;height:8px;border-radius:50%;background:var(--on-accent);animation:pulse 2.2s ease-in-out infinite;flex-shrink:0}
+@keyframes pulse{0%,100%{opacity:.95}50%{opacity:.3}}
+.pd-gridhead{font-size:11.5px;color:var(--muted);letter-spacing:.04em}
+.pd-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+@media(max-width:480px){.pd-grid{grid-template-columns:repeat(2,1fr)}}
+.pd-plug{position:relative;text-align:left;background:var(--surface);border:1.5px solid var(--accent-border);border-radius:11px;padding:10px 10px 9px;cursor:pointer;font-family:inherit;color:var(--text);transition:border-color .15s,opacity .15s,transform .12s}
+.pd-plug:hover{transform:translateY(-1px)}
+.pd-name{display:block;font-weight:800;font-size:13px;line-height:1.4}
+.pd-own{display:block;font-size:11.3px;color:var(--muted);margin-top:1px;line-height:1.5}
+.pd-tag{display:inline-block;margin-top:7px;font-size:10.5px;font-weight:800;letter-spacing:.05em;color:var(--accent);background:var(--accent-soft);border-radius:99px;padding:1px 9px}
+.pd-plug.out{border-style:dashed;border-color:var(--border);background:transparent;opacity:.62}
+.pd-plug.out .pd-name{color:var(--muted)}
+.pd-plug.out .pd-tag{color:var(--muted);background:transparent;border:1px solid var(--border)}
+.pd-plug.stale{border-color:var(--warn);border-style:dashed}
+.pd-plug.stale .pd-tag{color:var(--warn);background:var(--warn-soft)}
+.pd-sec{font-size:11.5px;color:var(--muted);margin-top:3px}
+.pd-debt{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
+.pd-debt .pd-plug{flex:1;min-width:160px}
+.pd-btn{background:var(--accent);color:var(--on-accent);border:none;border-radius:11px;padding:9px 15px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:inherit}
+.pd-status{font-size:12.6px;color:var(--text);background:var(--surface);border:1px dashed var(--border);border-radius:10px;padding:9px 12px;font-weight:600}
+.pd-reset{align-self:flex-start;background:none;border:none;color:var(--muted);font-size:11.5px;cursor:pointer;font-family:inherit;text-decoration:underline;padding:0}
+
+/* ---- special forces ---- */
+.sf-bar{display:flex;height:44px;border-radius:10px;overflow:hidden;border:1px solid var(--border)}
+.sf-a{width:75%;background:var(--accent);color:var(--on-accent);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;min-width:0}
+.sf-b{width:25%;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;border-left:1px solid var(--accent-border);min-width:0}
+.sf-legend{margin-top:10px;display:flex;flex-direction:column;gap:5px;font-size:12.8px}
+.sf-legend .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+.dot.a{background:var(--accent)}
+.dot.b{background:var(--accent-soft);border:1px solid var(--accent-border)}
+.sf-fit{display:grid;grid-template-columns:1fr;gap:8px;margin-top:12px}
+@media(min-width:560px){.sf-fit{grid-template-columns:1fr 1fr}}
+.fit{border-radius:10px;padding:9px 12px;font-size:12.8px;border:1px solid var(--border);background:var(--surface);line-height:1.6}
+.fit b{display:inline-block;font-size:11px;font-weight:800;padding:1px 9px;border-radius:99px;margin-right:8px}
+.fit.ok b{color:var(--accent);background:var(--accent-soft)}
+.fit.no b{color:var(--warn);background:var(--warn-soft)}
+</style>
+<style id="recording-agent-mobile-safety">
+/* Component-name-agnostic mobile safety net.
+   Structural guarantees are expressed against CSS Grid/Flex behaviour and
+   generic attribute hooks rather than a fixed class vocabulary, so generating
+   models may invent component names freely for any recording type. */
+*, *::before, *::after { box-sizing: border-box; }
+html { width: 100%; min-width: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { width: 100%; min-width: 0; margin: 0; overflow-wrap: break-word; }
+main, header, footer, nav, section, article, aside, figure, div, ul, ol, li, dl, dd, details { min-width: 0; }
+img, picture, video, canvas, svg { display: block; max-width: 100%; height: auto; }
+pre, code, kbd, samp { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+h1, h2, h3, h4, h5, h6, p, li, td, th, dt, dd, blockquote, figcaption { overflow-wrap: anywhere; }
+input, textarea, select, button { max-width: 100%; font: inherit; }
+/* Any table gets a scroll container by intent or by generic hook. */
+.table-scroll, .table-wrap, .matrix-wrap, [data-table-scroll], [data-scroll-x] {
+  max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.table-scroll > table, .table-wrap > table, .matrix-wrap > table,
+[data-table-scroll] > table, [data-scroll-x] > table { margin: 0; }
+/* Numbered step rows: keep body copy out of the counter track. */
+.step-item, [data-step-item] { grid-template-columns: 32px minmax(0, 1fr) !important; }
+.step-item::before, [data-step-item]::before { grid-column: 1 !important; grid-row: 1 !important; }
+.step-item > :empty, [data-step-item] > :empty { display: none !important; }
+.step-item > *, [data-step-item] > * { grid-column: 2 !important; min-width: 0 !important; }
+.data-value, .metric-value, [data-value] { max-width: 100%; font-variant-numeric: tabular-nums; }
+/* A single surviving child of ANY grid spans the full row. Applied to every
+   element that declares a grid, so unknown component names are covered too. */
+[class*="grid"] > :only-child,
+[class*="board"] > :only-child,
+[class*="cluster"] > :only-child,
+[class*="row"] > :only-child,
+[class*="split"] > :only-child,
+[class*="cols"] > :only-child,
+[class*="columns"] > :only-child,
+[class*="layout"] > :only-child,
+[class*="panel"] > :only-child,
+[data-grid] > :only-child,
+[data-cols] > :only-child {
+  grid-column: 1 / -1 !important;
+  width: 100% !important;
+}
+@media (max-width: 600px) {
+  body { font-size: 14.5px !important; line-height: 1.62 !important; }
+  :where(body > main, body > .report-shell, body > .report, body > .container, body > [data-shell]) {
+    width: calc(100% - 40px) !important;
+    max-width: 100% !important;
+    margin-inline: auto !important;
+  }
+  h1 { font-size: 29px !important; line-height: 1.22 !important; letter-spacing: 0 !important; }
+  h2 { font-size: 22px !important; line-height: 1.3 !important; letter-spacing: 0 !important; }
+  h3 { font-size: 16px !important; line-height: 1.42 !important; letter-spacing: 0 !important; }
+  /* Generic collapse: every multi-column grid becomes single column unless it
+     explicitly opts into staying paired (data-keep-columns) or is a table. */
+  [class*="grid"]:not([data-keep-columns]),
+  [class*="board"]:not([data-keep-columns]),
+  [class*="split"]:not([data-keep-columns]),
+  [class*="cols"]:not([data-keep-columns]),
+  [class*="columns"]:not([data-keep-columns]),
+  [class*="layout"]:not([data-keep-columns]),
+  [data-grid]:not([data-keep-columns]) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  /* Compact numeric clusters may stay two-up, but a trailing odd card must
+     span both columns so no empty half-row is left on narrow screens. */
+  [data-keep-columns] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  [data-keep-columns] > :last-child:nth-child(odd) { grid-column: 1 / -1 !important; }
+  [data-span-all], [data-value-kind="formula"], [data-value-kind="range"] { grid-column: 1 / -1 !important; }
+  /* Horizontal flows become vertical. */
+  [class*="flow"], [class*="chain"], [class*="timeline"] { flex-direction: column !important; }
+  [class*="arrow"] { transform: rotate(90deg); min-height: 16px !important; }
+  table { font-size: 12.5px; }
+  th, td { padding: 9px 8px !important; }
+  nav { max-width: 100%; }
+  nav[data-scrollable] { overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: thin; }
+  button, summary, [role="button"] { min-width: 44px; min-height: 44px; }
+  nav a { display: inline-flex; min-width: 44px; min-height: 44px; padding: 6px 10px !important; align-items: center; justify-content: center; font-size: 12.5px !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+</style>
+<style id="recording-agent-first-viewport-safety">
+body > :first-child { margin-top: 0 !important; }
+:where(body, body > main, [class*="shell"], [class*="container"]) > :where(
+  [class*="hero"], [class*="cover"], [data-hero]
+):first-child {
+  min-height: auto !important;
+  max-height: none !important;
+  margin-top: 0 !important;
+  padding-top: min(40px, 8vw) !important;
+}
+@media (max-width: 600px) {
+  :where(body, body > main, [class*="shell"], [class*="container"]) > :where(
+    [class*="hero"], [class*="cover"], [data-hero]
+  ):first-child { padding-top: 20px !important; }
+}
+</style>
+<style id="repair-arrow-label-orientation-v1">repair-arrow-glyph{display:contents}@media(max-width:600px){[data-repair-arrow-label="al-0"]{transform:none!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important}}
+@media(max-width:600px){[data-repair-arrow-label="al-1"]{transform:none!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important}}</style></head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="kicker">AI 时代的组织 · 直播对谈实录整理</div>
+    <h1>超级团队落地：Manus 的可插拔实践</h1>
+    <p>从「五块基建」的研究框架，走进 Manus 的实践现场。嘉宾于毅（加入 Manus 约一个月）与主持人（Meta 背景）聊了一个半小时，穿插观众问答，这是整理后的完整脉络。</p>
+  </header>
+
+  <div class="part"><span class="pnum">PART 1</span><h2>框架：超级团队是结构的产物</h2><span class="rule"></span></div>
+
+  <section class="card">
+    <h3>五块基建评估框架</h3>
+    <p>联盟制、为任务临时聚散的团队形态，正随 AI 出现；但放之四海皆准的一点是——超级团队是一种<b>结构的产物</b>。当时提了五块基建，用来评估一个团队所处的阶段。</p>
+    <figure class="fig" data-visual-id="five-infra-blocks" data-visual-title="超级团队五块基建评估框架" data-visual-type="框架图" data-visual-relation="超级团队是结构的产物；形态、技术地基、协调、决策、人五块基建，用于评估团队所处阶段" data-visual-source="我们提了5块的基建……方便去评估去衡量我们到底处于什么样的阶段">
+      <figcaption><span class="fig-tag">框架图</span>形态 → 地基 → 协调 → 决策 → 人</figcaption>
+      <div class="infra">
+        <div class="irow"><span class="inum">1</span><div class="ibody"><div class="iname">形态</div><div class="idesc">按 AI 与人所处的位置分三种：<span class="chip mini">节点辐射</span><span class="chip mini">网络协作</span><span class="chip mini">AI 中枢</span></div></div></div>
+        <div class="irow"><span class="inum">2</span><div class="ibody"><div class="iname">技术地基</div><div class="idesc">信息可见性 <span class="arr">→</span> 能力可协调 <span class="arr">→</span> 协调可自动化</div></div></div>
+        <div class="irow"><span class="inum">3</span><div class="ibody"><div class="iname">协调</div><div class="idesc">透明化路由的替代 · 主动的任务编排</div></div></div>
+        <div class="irow"><span class="inum">4</span><div class="ibody"><div class="iname">决策</div><div class="idesc"><span class="chip mini plain">集中</span><span class="chip mini plain">委托</span><span class="chip mini plain">共识</span><span class="chip mini plain">AI 辅助</span></div></div></div>
+        <div class="irow"><span class="inum">5</span><div class="ibody"><div class="iname">人</div><div class="idesc">自主权 · 成长环境 · 经济回报与退出自由的保障</div></div></div>
+      </div>
+      <p class="fignote">达成不靠主观意愿——信息可见、能力可协调，都需要技术、产品与工作形态的支撑。</p>
+    </figure>
+  </section>
+
+  <section class="card">
+    <h3>两个悬而未决的难题</h3>
+    <p><b>单元怎么切。</b>AI 让每个人的行动与协作单元变大变宽，但边界怎么划（当时看到 POD 等模式）？解法有两类：把一整件事<em class="hl">闭环交给一个团队</em>，不依赖他人协作；或把小单元扩成大单元，让产出<em class="hl">可被单独评估</em>——好坏不再被「其他单元不配合」稀释。</p>
+    <p><b>AI 怎么看到全部上下文。</b>给 AI 的权限加上下文，很大程度上决定它在组织里能起什么作用；当人与 AI 的效率差出 10 倍、100 倍，人该解决什么问题，也还没有共识。</p>
+    <div class="insight"><span class="tag">当时判断</span>各类解法「都还在进化过程中」——没有标准答案，只能放进自己的场景重新问一遍。</div>
+  </section>
+
+  <div class="part"><span class="pnum">PART 2</span><h2>架构：经典内核 + 可插拔插件</h2><span class="rule"></span></div>
+
+  <div class="lead">「这不是唯一的解法，是这个组织从它正在做的事、和已有的能力里长出来的解法——每个团队的知识土壤不一样，<b>照抄很容易抄坏</b>。」带着五块基建的问题清单，来看 Manus 的答案。</div>
+
+  <section class="card">
+    <h3>可插拔：组织与技术同构</h3>
+    <p>做法是让<em class="hl">架构与单元解耦</em>：内核做得足够经典，所有相关架构与功能都变成插件——能插上，也能拔出。每个单元独立完成自己架构里的事，产出又能被中台吸收。</p>
+    <figure class="fig" data-visual-id="manus-plugin-architecture" data-visual-title="Manus 经典内核与可插拔插件（可操作）" data-visual-type="交互架构示意图" data-visual-relation="经典内核上以插件挂载各 team 的功能单元；为旧模型做的工程手段也可拔出，模型能力提升后释放 AI 能力" data-visual-source="把内核变得足够经典，把架构和功能变成一个插件……让工程化的手段变成可插拔，模型能力上来后迅速拔下，释放AI的能力">
+      <figcaption><span class="fig-tag">可操作</span>经典内核与可插拔插件 —— 点击卡片试试</figcaption>
+      <div class="pd">
+        <div class="pd-kernel"><span class="pd-led"></span>经典内核 · 稳定大版本</div>
+        <div class="pd-gridhead">六个 team 各管自己的插件、仓库与发版</div>
+        <div class="pd-grid" id="pdGrid" data-grid="" data-keep-columns="">
+          <button class="pd-plug" type="button"><span class="pd-name">视频编辑</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-plug" type="button"><span class="pd-name">网络开发</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-plug" type="button"><span class="pd-name">幻灯片</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-plug" type="button"><span class="pd-name">电脑操作</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-plug" type="button"><span class="pd-name">定时触发</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-plug" type="button"><span class="pd-name">旅行</span><span class="pd-tag">已接入</span></button>
+        </div>
+        <div class="pd-sec">另一类插件：为旧模型做的工程手段</div>
+        <div class="pd-debt">
+          <button class="pd-plug" id="pdLegacy" type="button"><span class="pd-name">工程补偿</span><span class="pd-own">模型变强前的人工兜底</span><span class="pd-tag">已接入</span></button>
+          <button class="pd-btn" id="pdModelUp" type="button">模拟：模型能力提升</button>
+        </div>
+        <div class="pd-status" id="pdStatus"></div>
+        <button class="pd-reset" id="pdReset" type="button">重置演示</button>
+      </div>
+    </figure>
+    <ul class="ticks">
+      <li>改功能、补测试不牵动大版本：提完之后 <b>20–30 分钟</b>就能改好测好，直接在产品里验证。</li>
+      <li><b>债务轮转</b>：AI 进步快，为旧模型做的工程手段很容易变成债务；做成可插拔，模型能力上来就快速评估、拔掉旧的，把空间还给 AI。</li>
+      <li>这套思路不止在技术层——组织里同样用「可插拔」运转。嘉宾临时加入新功能项目时发现，两边是同一套打法。</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h3>扁平：既是结果也是设计</h3>
+    <ul class="ticks">
+      <li>AI 化不等于裁员——Manus 反而<b>在疯狂招人</b>。插件化架构让人员的加入或流失，不会冲垮团队文化。</li>
+      <li>招募负责人蔡斌的回答：这种结构让人<em class="hl">更敢招人</em>——之前担心新人不可控、搅动原有产品与组织，现在更敢招、更敢做业务尝试。</li>
+      <li>没有强上中台：目前更多在做<b>基建</b>；中台的角色由 manager 与 Agent 承担，不强制所有人共用一个中台。</li>
+      <li>重点打视频编辑，就以插件形式进入产品；新探索同样快速插拔、快速验证——<em class="hl">速生速死</em>，保住生产力与增长速度。</li>
+      <li>「扁平是结果还是设计？」——<b>既是结果，又是设计</b>：组织正好能承接技术与债务之间的快速轮转。</li>
+    </ul>
+  </section>
+
+  <div class="part"><span class="pnum">PART 3</span><h2>共享层：Mono、Much 与 skill</h2><span class="rule"></span></div>
+
+  <section class="card">
+    <h3>Mono：让大仓对所有人可见</h3>
+    <p>Mono 是开发与产品共用的 project / Agent，架在「大仓 + 可插拔小仓」之上。打开 Monica 连上本地电脑即可安装（需在公司 GitHub 内）；接入即获得共享 skill、工具、团队知识与仓库地图，owner 决定你拿到<b>编辑权</b>还是<b>只读</b>。</p>
+    <figure class="fig" data-visual-id="mono-project-structure" data-visual-title="Mono 的三层共享结构" data-visual-type="分层示意图" data-visual-relation="大仓底座上，Project 层共享 skill、知识与仓库地图；调用层人人可调 Agent，活跃会话透明可见、可随时纠偏" data-visual-source="大仓的概念……所有仓库面对所有人……借助AI去理解仓库；正在活动中的30多个、50多个会话……我可能会直接参与到这个过程当中">
+      <figcaption><span class="fig-tag">分层示意</span>Mono：从大仓到人人可调</figcaption>
+      <div class="stack">
+        <div class="slayer"><b>调用层 · 人与 Agent</b><span>Slack / 会话里直接 @Agent 调用；AI 也拥有「做第一步」的自主权，活跃会话公开可点开</span></div>
+        <div class="sarrow" data-repair-arrow-label="al-0">↑ 可见 · ↓ 可调用</div>
+        <div class="slayer"><b>Project 层 · 共享</b><span>共享 skill · 团队知识 · 规则 · 仓库地图 —— owner 分配编辑 / 只读权限</span></div>
+        <div class="sarrow" data-repair-arrow-label="al-1">↑ 知识与地图 · ↓ 读写仓库</div>
+        <div class="slayer s-base"><b>大仓底座 · Monorepo</b><span>所有仓库 + 可插拔小仓；非开发也能借 AI 看懂仓库里在发生什么</span></div>
+      </div>
+    </figure>
+    <ul class="ticks">
+      <li>经常同时有 <b>30–50 个</b>活跃会话在跑；有编辑权限就能点开，看清任务从哪来、走到哪。</li>
+      <li>需求方发现跑偏，直接进场纠偏：「这跟我提的需求完全是两回事。」——生产者与需求方共用同一个事实源。</li>
+      <li>生产、测试、线上发版、bug、数据分析的仓库与 Agent 全部接入 Mono。</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h3>Much：一条 bug 的流转路</h3>
+    <p>Much 是公司搭建的查 bug Agent。现在提 bug 很少直接找程序员——在 Slack 的 bug 频道贴出来就行。</p>
+    <figure class="fig" data-visual-id="mono-much-flow" data-visual-title="Much 与 Mono 修 bug 的工作流" data-visual-type="流程图" data-visual-relation="Slack 贴 bug → Much 排查定级、给临时解法并分配 → 员工修或 @Agent 直接修 → 提 PR 由开发合并" data-visual-source="在 Slack 的 bug 频道里直接贴出来……分配给某个员工……或者@mono说这个bug你可以修……提PR之后我们来合并">
+      <figcaption><span class="fig-tag">流程</span>从贴 bug 到 PR 合并</figcaption>
+      <div class="flow v">
+        <div class="fstep"><span class="fnum">1</span><div><b>贴出 bug</b><span class="fsub">Slack 的 bug 频道，@ 负责排查的 Much</span></div></div>
+        <div class="fstep"><span class="fnum">2</span><div><b>Much 排查</b><span class="fsub">定级（如 P 级）、给出临时解法、分配给负责人</span></div></div>
+        <div class="fbranch" data-grid="">
+          <div class="fstep"><span class="fnum">3a</span><div><b>交给员工修</b><span class="fsub">Much 把任务直接派给对应开发</span></div></div>
+          <div class="fstep"><span class="fnum">3b</span><div><b>AI 直接修</b><span class="fsub">判断 AI 能胜任 → @Much / @Mono 动手，打开会话看它怎么修</span></div></div>
+        </div>
+        <div class="fstep"><span class="fnum">4</span><div><b>提 PR → 开发合并</b><span class="fsub">验证有效的修复，从代码层固定下来</span></div></div>
+      </div>
+    </figure>
+    <p class="note">Much 与 Mono 都是公司基座；同事在其上挂专有知识，改造出个人 Agent——本人不在线，也能和他的 Agent 在 session 里协作，「挺魔幻的」。</p>
+  </section>
+
+  <section class="card">
+    <h3>skill 的双轨治理</h3>
+    <p>观众问：Mono 仓库里的 skill 由谁评判、怎么维护？答案是两条轨道并行。</p>
+    <figure class="fig" data-visual-id="skill-governance-flow" data-visual-title="公版与项目 skill 的双轨治理" data-visual-type="对照图" data-visual-relation="公版 skill 全员可提 PR / fork 但落地权限在极少数负责人；项目自有 skill 全员可改、可回滚" data-visual-source="所有人都可以提，所有人都可以fork，但最终的权限还是……真正的产品负责人……用得不对我们就回滚">
+      <figcaption><span class="fig-tag">对照</span>公版收紧 · 项目放开</figcaption>
+      <div class="duo" data-grid="">
+        <div class="panel">
+          <div class="p-t">公版 skill</div>
+          <div class="p-s">公司级资产 · 如 Mono 仓库</div>
+          <ul class="mini">
+            <li>所有人可提 PR、可 fork —— <b>饱和式攻击</b></li>
+            <li>落地权限在极少数产品负责人手里</li>
+            <li>哪条路线胜出，靠人的品味最终把关</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <div class="p-t">项目自有 skill</div>
+          <div class="p-s">探索型 project · 如嘉宾的创意 pod</div>
+          <ul class="mini">
+            <li>全员可改，用得不对就<b>回滚</b></li>
+            <li>群策群力，为探索服务</li>
+            <li>不同项目可定不同规则</li>
+          </ul>
+        </div>
+      </div>
+    </figure>
+    <p class="note">公版 skill 是反复验证过的公司级资产；大量会话在跑，哪些能真正「破出去」，最终由人的品味把关、整理。</p>
+  </section>
+
+  <section class="card">
+    <h3>分享意愿：绑定而非奖金</h3>
+    <p>观众问：怎么让大家愿意把摸索出的经验分享出来？Manus 的答案：分享首先是<em class="hl">防御性的</em>——节奏快到没人容忍某个环节拖慢自己。「你太慢了，我有个好用的东西你来用，咱们一起快。」甚至「你不帮我解决，你就准备难受吧」。创业公司以拿到结果为先，藏私的空间很小。</p>
+    <figure class="fig" data-visual-id="skill-incentive-mechanism" data-visual-title="skill 分享的障碍与解法" data-visual-type="对照矩阵" data-visual-relation="分享障碍（归属不安、skill 强绑定环境、现金激励对抗）对应三类解法：绑定本人、技术衔接、文化默认项" data-visual-source="你的skill你的Agent出来的结果跟你本人是绑定的……把员工当leader去做管理去做考核">
+      <figcaption><span class="fig-tag">对照矩阵</span>分享的障碍与解法</figcaption>
+      <div class="mx">
+        <div class="mx-row" data-grid="">
+          <div class="mcell mx-a"><i>障碍</i><br>成果归属的不安全感——「你用了，算谁的成绩？」</div>
+          <div class="mcell mx-b"><i>解法</i><br>产出<b>绑定本人</b>：把员工当 leader 考核，其 Agent 的成果计入名下；Meta 用 marketplace 的下载数与点赞计入绩效</div>
+        </div>
+        <div class="mx-row" data-grid="">
+          <div class="mcell mx-a"><i>障碍</i><br>skill 与模型、上下文强绑定——跨模型可能失效，重度 skill 一天迭代十几版</div>
+          <div class="mcell mx-b"><i>解法</i><br>承认绑定并做<b>技术衔接</b>：公板与本地 Agent 沟通补效果、做隐私保护；协作时分享 session 或拉进 project——能调用，看不到背后</div>
+        </div>
+        <div class="mx-row" data-grid="">
+          <div class="mcell mx-a"><i>障碍</i><br>现金激励制造对抗——「传一个 skill 给 100 块，这 100 块可能干掉我的工作」</div>
+          <div class="mcell mx-b"><i>解法</i><br><b>不靠奖金</b>：把用 AI 设为团队默认项；慢的环节会被同事直接上手改造，分享变成相互救火</div>
+        </div>
+      </div>
+    </figure>
+    <p class="note">文化的底座：入职访谈时最开心的不只是 token 自由，而是发现「没有人默认独立工作，所有人都默认用 AI」——用 AI 是植入基因的默认项，不是可选项。所有人同一套系统，与还要兼容另一套，天差地别。</p>
+  </section>
+
+  <div class="part"><span class="pnum">PART 4</span><h2>人的位置：人与 Agent 的 action space</h2><span class="rule"></span></div>
+
+  <section class="card">
+    <h3>任务流转：派单、验收与纠偏</h3>
+    <p>Agent 与人被放在<em class="hl">同一个主体位置</em>：人可以 @Agent，Agent 也可以 @人。派单的依据，是 project 里的一份特殊上下文——记录每个成员擅长什么、有什么特点；人写初始版，AI 根据任务结果持续分析。</p>
+    <p>为什么不让信息经人转手？「你问我一件事，我去问我的 AI，AI 给了我我再给你，你再问你的 AI」——<b>人当中转，是在给信息传输降速</b>。</p>
+    <figure class="fig" data-visual-id="agent-dispatch-board" data-visual-title="AI 派单与抢单广场" data-visual-type="对照图" data-visual-relation="AI 按任务标签匹配负责人直接派单；抢单广场上，AI 指定的单其他人也可以抢" data-visual-source="这个任务是跟哪些标签有关，谁在这一块是负责的，他去@了……有一个抢单广场……你也可以把这个单抢下来">
+      <figcaption><span class="fig-tag">对照</span>任务从哪来：派单与抢单</figcaption>
+      <div class="duo" data-grid="">
+        <div class="panel">
+          <div class="p-t">AI 直接派单</div>
+          <ul class="mini">
+            <li>任务自动打上标签</li>
+            <li>匹配「谁负责、谁熟悉」</li>
+            <li>Agent 直接 @ 人接单</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <div class="p-t">抢单广场</div>
+          <ul class="mini">
+            <li>任务公开陈列</li>
+            <li>AI 指定的人之外</li>
+            <li>其他人也可以把单抢下来</li>
+          </ul>
+        </div>
+      </div>
+    </figure>
+    <figure class="fig" data-visual-id="human-plugin-governance" data-visual-title="人作为插件的介入机制" data-visual-type="流程图" data-visual-relation="Agent 完成第一步后 @ 人验收；人可随时介入纠偏，会话仍归属做事者" data-visual-source="他会去@谁谁谁说你过来看一下结果……我的作用只是把任务纠偏纠过来，会话还是属于那个在做的人">
+      <figcaption><span class="fig-tag">流程</span>做完第一步之后：验收与纠偏</figcaption>
+      <div class="flow v">
+        <div class="fstep"><span class="fnum">1</span><div><b>Agent 完成第一步</b><span class="fsub">默认动作：初版实现、排查、派单</span></div></div>
+        <div class="fstep"><span class="fnum">2</span><div><b>Agent @ 人</b><span class="fsub">验收结果 / 给指导 / 「别做了」；@ 错了人，由人调整</span></div></div>
+        <div class="fstep"><span class="fnum">3</span><div><b>人可随时介入</b><span class="fsub">发现方向跑偏，点开会话直接纠偏，把任务拗回来</span></div></div>
+        <div class="fstep"><span class="fnum">4</span><div><b>会话仍归属做事者</b><span class="fsub">人只纠偏不接管——避免方向性错误与 token 浪费</span></div></div>
+      </div>
+    </figure>
+    <ul class="ticks">
+      <li>第一步普遍默认给 AI，因为它更快；<b>基于结果拍板与决策，仍是人的</b>。</li>
+      <li>更激进的做法是直接拿市场反馈当裁判，但「只用数据衡量对错」只在极少数业务上成立。</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h3>判断不了就找同事</h3>
+    <p>嘉宾在做一个手势识别控制电脑的软件，安全设计上 AI 给了 A/B/C 三种方案——「我知道有解法，但无法判断哪种在我的环境里可行」。</p>
+    <figure class="fig" data-visual-id="ai-ask-colleague-flow" data-visual-title="让 Agent 找同事问方案" data-visual-type="流程图" data-visual-relation="AI 方案无法自行判断时，Agent 筛出该问的同事并起草问题，回答回流修订后定稿进入开发" data-visual-source="他给了ABC三种方案……你去看一下我的同事我要问谁……问完了之后他就直接进入到开发的环节">
+      <figcaption><span class="fig-tag">流程</span>从方案存疑到定稿进开发</figcaption>
+      <div class="flow v">
+        <div class="fstep"><span class="fnum">1</span><div><b>AI 给出 A/B/C 三种方案</b><span class="fsub">安全设计问题——我理解方案，但无法判断适用性</span></div></div>
+        <div class="fstep"><span class="fnum">2</span><div><b>让 Agent 筛「该问谁」</b><span class="fsub">→ 阿斌 + 安全方向的同事，并由 Agent 起草提问</span></div></div>
+        <div class="fstep"><span class="fnum">3</span><div><b>同事回答</b><span class="fsub">关键发现：真问题并不是那三个</span></div></div>
+        <div class="fstep"><span class="fnum">4</span><div><b>回答补回 AI → 方案修订、定稿</b><span class="fsub">AI 再与同事对齐一轮，收敛出可行方案</span></div></div>
+        <div class="fstep"><span class="fnum">5</span><div><b>直接进入开发环节</b></div></div>
+      </div>
+    </figure>
+    <div class="insight"><span class="tag">提示</span>找人不是外包思考，而是省 token、省注意力——不困在不懂的问题里反复抽卡。面试仍会考系统设计这类基础：计划一开始就错，试错代价最高。这也是「超级个体做久了，发现真的很需要团队」。</div>
+  </section>
+
+  <section class="card">
+    <h3>岗位边界在变淡</h3>
+    <ul class="ticks">
+      <li><b>先聊 Agent，再聊本人</b>：data agent 比成员掌握更多上下文，嘉宾的习惯是先跟 Agent 聊完再去见人——onboarding 因此更快。</li>
+      <li>开发直接说「我不想做中介」：产品的 bug 与小功能，自己跟 Agent 验证解法，再由开发从代码层固定；或让 Mono 直接改、提 PR 合并。</li>
+      <li>产品在做增长、要求开发在代码层配合市场讲解；工程师做 UI、查数据——「岗位之间的边界越来越淡」。</li>
+      <li>Meta 印证（主持人）：全栈、工程师主导的文化下，写代码之外还要找方向、定 UI、做数据分析——<b>端到端交付</b>，PM 也要懂工程化增长，对人的要求在变高。</li>
+      <li>面试观察：本职之外用 AI 做过<em class="hl">编制外的探索</em>，已是明显加分项。</li>
+    </ul>
+    <div class="insight"><span class="tag">提示</span>全流程用 AI 过一遍，不是为了样样自己做：见过 AI 的产出与强同事的产出，才知道哪里用 AI、哪里用同事——品味提升，摩擦下降。AI 能做到的不麻烦同事；用同事，就用 AI 做不出的那部分。</div>
+  </section>
+
+  <section class="card">
+    <h3>日常：事务给 Agent，创意留给人</h3>
+    <ul class="ticks">
+      <li>onboarding 跟 AI 一起做：Agent 建议先跟谁聊、帮忙排日程；Slack 与 Agent 绑定，它定期查看谁找了我、有什么要紧事，替我处理事务性回复，聊完再把上下文喂回去。</li>
+      <li><b>视频与图片成了新的沟通方式</b>：讲一个新功能，直接让 AI「戳」一套系统出来，顺手把演示视频做了——从用户视角一步步看。</li>
+      <li>创意 pod 收集点子、给出新方法，人拍板做不做；做出后 Agent 在频道里 @ 对的人——IP 相关找风控、游戏相关找验收，问渠道怎么发。</li>
+    </ul>
+  </section>
+
+  <div class="part"><span class="pnum">PART 5</span><h2>边界与投入：像风投一样配置 AI</h2><span class="rule"></span></div>
+
+  <section class="card">
+    <h3>不能原子化怎么办</h3>
+    <p>观众问：金融机构的 data team 与 AI team 交叉合作，拆不到产品功能那么原子化，插件化是不是行不通？</p>
+    <ul class="ticks">
+      <li>底层逻辑不变：<b>中心化的上下文、端到端的交付、透明的信息可见性</b>。</li>
+      <li>每个团队都有自主权打造自己的 project 与 Agent；「人不当信息中转」等原则，是可直接复用的起点。</li>
+      <li>受权限约束的行业，自下而上探索——<em class="hl">不能照抄</em>。</li>
+    </ul>
+    <figure class="fig" data-visual-id="bottom-up-principles" data-visual-title="底层原则先行、结构自然生长" data-visual-type="流程图" data-visual-relation="先设计底层原则与 action space，跑通人+Agent 验证循环后结构自然长出，再观察修剪" data-visual-source="该设计的地方是那些基础的底层的原则和action space……跑通了之后自然而然地长出来，再去做观察和调整修剪">
+      <figcaption><span class="fig-tag">流程</span>原则先行，结构自然生长</figcaption>
+      <div class="flow h">
+        <div class="fstep"><span class="fnum">1</span><div><b>设计底层原则与 action space</b><span class="fsub">如：人不当信息中转、上下文对 Agent 可见、人可随时介入</span></div></div>
+        <div class="fstep"><span class="fnum">2</span><div><b>跑通验证循环</b><span class="fsub">「人 + Agent → 结果」的闭环先转起来</span></div></div>
+        <div class="fstep"><span class="fnum">3</span><div><b>结构自然长出</b><span class="fsub">再观察、修剪、调整</span></div></div>
+      </div>
+      <p class="fignote">一开始就设计结构会出大问题：你不知道 AI 和人会在业务里怎么协作。</p>
+    </figure>
+  </section>
+
+  <section class="card">
+    <h3>AI 特种部队的投入观</h3>
+    <p>超级个体 / 超级团队不是人人都要当，它更像<b>特种部队</b>：能力很强、花钱也很多——一个超级个体一天的花费，可能顶某些普通团队一个月，一套「装备」的钱能养一个小队；装备与战术随时更换以保持最先进，波动与浪费是常态，对人的要求也高。</p>
+    <figure class="fig" data-visual-id="special-forces-allocation" data-visual-title="特种部队式的不均衡投入" data-visual-type="对照图" data-visual-relation="AI 投入不均衡：示例 2000 美金中 1500 给少数探索者、500 保底全员会用 AI；只用于开拓性高回报业务" data-visual-source="假设是说2000美金的token的费用，你可能需要1500美金交给这些人让他去做探索，然后500美金确保所有人都能够用AI">
+      <figcaption><span class="fig-tag">示例</span>不均衡的 token 预算（以 2000 美金 / 月为例）</figcaption>
+      <div class="sf-bar"><div class="sf-a">1500</div><div class="sf-b">500</div></div>
+      <div class="sf-legend">
+        <div><i class="dot a"></i>1500 美金 → 少数探索者，冲第二曲线</div>
+        <div><i class="dot b"></i>500 美金 → 保底：全员会用 AI、不抵触、知道边界</div>
+      </div>
+      <div class="sf-fit" data-grid="">
+        <div class="fit ok"><b>适合</b>开拓性、高回报的业务</div>
+        <div class="fit no"><b>不适合</b>低增长、需要安全稳定的业务</div>
+      </div>
+      <p class="fignote">特征：高成本 · 高波动 · 高要求——装备随时更换，浪费是维持最先进的代价。</p>
+    </figure>
+    <ul class="ticks">
+      <li>与其现在精确计算 ROI，不如找业务里能承受<em class="hl">高风险、高投入、高回报</em>的位置——AI 的投入本就不该均衡分布，人与模型都不例外。</li>
+      <li>大多数人不需要成为 creator：用好 AI、不抵触、知道边界即可——这更像风险投资与孵化，不是普惠培训。</li>
+      <li>「批量生产超级个体」？等半年到一年，模型会带着所有人成为此刻意义上的超级个体；但<em class="hl">永远保持</em>超级团队，是另一个概念。</li>
+      <li>Meta 印证（主持人）：激进的 AI 转型放在新产品、新项目上更容易验证；现有业务流程求稳，优化 ROI 低、转型也难。</li>
+    </ul>
+    <p class="note">1500 / 500 为嘉宾给出的比例示例，非实测数据；他补充「9 月之后再说」——这是他近一年的看法。</p>
+  </section>
+
+</div>
+
+<script>
+(function(){
+  var grid=document.getElementById('pdGrid');
+  if(!grid){return;}
+  var plugs=Array.prototype.slice.call(grid.querySelectorAll('.pd-plug'));
+  var legacy=document.getElementById('pdLegacy');
+  var btn=document.getElementById('pdModelUp');
+  var resetBtn=document.getElementById('pdReset');
+  var status=document.getElementById('pdStatus');
+  var stage=0;
+  function pluggedCount(){
+    var n=0;
+    plugs.forEach(function(p){ if(!p.classList.contains('out')){n++;} });
+    if(legacy && !legacy.classList.contains('out')){n++;}
+    return n;
+  }
+  function refresh(){
+    plugs.forEach(function(p){
+      p.querySelector('.pd-tag').textContent = p.classList.contains('out') ? '已拔出' : '已接入';
+    });
+    if(legacy){
+      var t=legacy.querySelector('.pd-tag');
+      if(stage===1){ t.textContent='可拔出'; }
+      else if(stage===2){ t.textContent='已拔出'; }
+      else { t.textContent='已接入'; }
+    }
+    if(stage===1){ status.textContent='模型能力已提升：旧工程手段成了债务，评估后可直接拔出'; }
+    else if(stage===2){ status.textContent='「工程补偿」已拔出 —— 工程债务清掉，空间还给 AI 能力 · 已接入 '+pluggedCount()+' 个插件'; }
+    else { status.textContent='已接入 '+pluggedCount()+' 个插件'; }
+  }
+  plugs.forEach(function(p){
+    p.addEventListener('click',function(){ p.classList.toggle('out'); refresh(); });
+  });
+  if(btn){
+    btn.addEventListener('click',function(){
+      if(stage===0){ stage=1; legacy.classList.add('stale'); btn.textContent='拔出「工程补偿」插件'; }
+      else if(stage===1){ stage=2; legacy.classList.remove('stale'); legacy.classList.add('out'); btn.style.display='none'; }
+      refresh();
+    });
+  }
+  if(legacy){
+    legacy.addEventListener('click',function(){ if(stage===1 && btn){ btn.click(); } });
+  }
+  if(resetBtn){
+    resetBtn.addEventListener('click',function(){
+      stage=0;
+      plugs.forEach(function(p){ p.classList.remove('out'); });
+      legacy.classList.remove('stale','out');
+      btn.style.display='';
+      btn.textContent='模拟：模型能力提升';
+      refresh();
+    });
+  }
+  refresh();
+})();
+</script>
+
+<template id="share-cover"><svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" fill="#f6f7f9"></rect><rect x="128" y="252" width="256" height="132" rx="26" fill="#4f46e5"></rect><rect x="160" y="296" width="56" height="12" rx="6" fill="#ffffff" opacity="0.4"></rect><rect x="228" y="296" width="56" height="12" rx="6" fill="#ffffff" opacity="0.4"></rect><rect x="296" y="296" width="56" height="12" rx="6" fill="#ffffff" opacity="0.4"></rect><line x1="164" y1="212" x2="164" y2="252" stroke="#4f46e5" stroke-width="8" stroke-linecap="round"></line><line x1="256" y1="212" x2="256" y2="252" stroke="#4f46e5" stroke-width="8" stroke-linecap="round"></line><line x1="348" y1="212" x2="348" y2="252" stroke="#4f46e5" stroke-width="8" stroke-linecap="round"></line><rect x="120" y="148" width="88" height="64" rx="16" fill="#ffffff" stroke="#4f46e5" stroke-width="8"></rect><rect x="212" y="148" width="88" height="64" rx="16" fill="#ffffff" stroke="#4f46e5" stroke-width="8"></rect><rect x="304" y="148" width="88" height="64" rx="16" fill="#ffffff" stroke="#4f46e5" stroke-width="8"></rect><g transform="rotate(-10 170 84)"><rect x="126" y="52" width="88" height="64" rx="16" fill="#ffffff" stroke="#4f46e5" stroke-width="8" stroke-dasharray="16 10"></rect></g><line x1="224" y1="92" x2="268" y2="128" stroke="#b9bdf3" stroke-width="6" stroke-linecap="round" stroke-dasharray="2 12"></line></svg></template>
+
+
+</body></html>

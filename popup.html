@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+  <title>纪要一键归档</title>
+</head>
+<body>
+  <header class="hd">
+    <div class="logo">↓</div>
+    <div>
+      <h1>纪要一键归档</h1>
+      <p class="sub">原件 + Markdown + 元信息 → 本地</p>
+    </div>
+  </header>
+
+  <div class="target">
+    <span class="dot"></span>
+    <span id="targetUrl">正在读取当前页面…</span>
+  </div>
+
+  <button id="go" class="primary">一键归档到下载目录</button>
+
+  <details class="opts" open>
+    <summary>输出选项</summary>
+    <label><input type="checkbox" id="includeHtml"> 内容 HTML 原件（外链资源需联网）</label>
+    <label><input type="checkbox" id="includeMarkdown"> 结构化 Markdown</label>
+    <label><input type="checkbox" id="includeMeta"> 元信息 JSON（含完整性自检）</label>
+    <label><input type="checkbox" id="includeCover"> 尝试下载封面图</label>
+    <label><input type="checkbox" id="includeShell"> 附带外层页面原件</label>
+    <label class="sep"><input type="checkbox" id="packZip"> 打包为单个 ZIP（关闭则分文件下载）</label>
+  </details>
+
+  <div id="status" class="status idle">就绪。打开分享页后点上方按钮即可。</div>
+  <div id="result" class="result" hidden></div>
+
+  <footer>适配：微信输入法 AI 录音笔 · 通用网页　|　<a href="#" id="reset">恢复默认</a></footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# 本地私有配置：真实分享链接 / token，切勿提交
+test/.local-share-url
+.share-url
+*.local.json
+
+# 测试自动生成的临时产物
+test/harness*.html
+test/_*.zip
+test/_*.md
+test/_downloads/
+test/_download/
+*.log
+
+# 环境与系统文件
+.workbuddy/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

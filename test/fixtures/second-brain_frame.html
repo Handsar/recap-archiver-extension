@@ -1,0 +1,1007 @@
+<!DOCTYPE html><html lang="zh-CN" data-recap-state="ok"><head><script>(function () {
+  var RESIZE = 'voice-recorder:resize';
+  var MEASURE = 'voice-recorder:measure';
+  var SCROLL = 'voice-recorder:scroll';
+  var STATE_ATTRIBUTE = 'data-recap-state';
+  var DEFAULT_STATE = 'ok';
+  var MEASURE_FALLBACK_DELAY = 120;
+  var pending = false;
+  var pendingTimer = null;
+  var lastHeight = 0;
+  var lastBackgroundColor;
+  var raf = window.requestAnimationFrame
+    || window.webkitRequestAnimationFrame
+    || function (callback) { return setTimeout(callback, 16); };
+
+  function readState() {
+    try {
+      return document.documentElement.getAttribute(STATE_ATTRIBUTE) || DEFAULT_STATE;
+    } catch (error) {
+      return DEFAULT_STATE;
+    }
+  }
+
+  function isBlankColor(color) {
+    return !color || color === 'transparent' || /^rgba\([^)]*,\s*0\s*\)$/.test(color);
+  }
+
+  function readBackgroundColor() {
+    try {
+      var elements = [document.body, document.documentElement];
+      for (var i = 0; i < elements.length; i += 1) {
+        if (!elements[i]) continue;
+        var color = getComputedStyle(elements[i]).backgroundColor;
+        if (isBlankColor(color)) continue;
+        // 半透明色无法直接作为外层底色，交给现有主题默认色兜底。
+        if (/^rgba\(/.test(color) && !/,\s*1\s*\)$/.test(color)) return '';
+        return color;
+      }
+    } catch (error) {
+      // 取色失败不影响高度同步。
+    }
+    return '';
+  }
+
+  function measure() {
+    pending = false;
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+    var body = document.body;
+    if (!body) return;
+    var style = getComputedStyle(body);
+    var height = Math.ceil(Math.max(body.scrollHeight, body.offsetHeight)
+      + (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0));
+    var backgroundColor = readBackgroundColor();
+    if (height <= 0 || (height === lastHeight && backgroundColor === lastBackgroundColor)) return;
+    lastHeight = height;
+    lastBackgroundColor = backgroundColor;
+    window.parent.postMessage({
+      type: RESIZE,
+      height: height,
+      backgroundColor: backgroundColor,
+      state: readState(),
+    }, '*');
+  }
+
+  function reportHeight() {
+    if (pending) return;
+    pending = true;
+    // rAF 在后台标签或被节流时可能长期不触发，用定时器兜底解锁，避免闩锁永久卡住。
+    pendingTimer = setTimeout(measure, MEASURE_FALLBACK_DELAY);
+    raf(measure);
+  }
+
+  window.addEventListener('message', function (event) {
+    if (event.source !== window.parent || !event.data || event.data.type !== MEASURE) return;
+    lastHeight = 0;
+    reportHeight();
+  });
+
+  function scrollToAnchor(hash) {
+    if (window.parent === window || !hash || hash.charAt(0) !== '#') return;
+    // 保留原生导航，直接读取浏览器选中的目标；ID 编码、旧式 name 和 :target 语义均由浏览器处理。
+    var target = document.querySelector(':target');
+    if (!target) {
+      var name = hash.slice(1);
+      try { name = decodeURIComponent(name); } catch (error) { /* 保留非标准编码的 ID。 */ }
+      if (name && name.toLowerCase() !== 'top') return;
+    }
+    if (target && !target.getClientRects().length) return;
+    // :target 或正文 hashchange 处理可能展开内容，先同步高度，避免父页按旧高度截断坐标。
+    measure();
+    // 使用正文文档坐标：原生导航可能先滚动旧尺寸的 iframe，全文扩高后内部滚动会归零。
+    var top = target ? target.getBoundingClientRect().top + (window.pageYOffset || 0) : 0;
+    if (target) top -= parseFloat(getComputedStyle(target).scrollMarginTop) || 0;
+    if (!isFinite(top)) return;
+    window.parent.postMessage({ type: SCROLL, top: Math.max(0, top) }, '*');
+  }
+
+  if (document.addEventListener) {
+    document.addEventListener('click', function (event) {
+      if (event.defaultPrevented || event.button !== 0
+        || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      var link = event.target;
+      while (link && (!link.tagName || link.tagName.toLowerCase() !== 'a')) link = link.parentNode;
+      if (!link || window.parent === window) return;
+      var previousURL = window.location.href;
+      // 捕获阶段只观察。等正文的 document/window 委托及默认动作完成后再检查是否被取消。
+      setTimeout(function () {
+        if (event.defaultPrevented || window.location.href !== previousURL || link.hasAttribute('download')) return;
+        var base = document.querySelector('base[target]');
+        var target = link.getAttribute('target') || (base && base.getAttribute('target'));
+        if (target && target.toLowerCase() !== '_self') return;
+        var href = link.href;
+        if (typeof href !== 'string' || href !== previousURL) return;
+        var separator = href.indexOf('#');
+        // 只补同一 URL 的重复点击；新的 fragment 由原生导航和 hashchange 处理。
+        if (separator >= 0) scrollToAnchor(href.slice(separator));
+      }, 0);
+    }, true);
+  }
+  window.addEventListener('hashchange', function () {
+    var href = window.location.href;
+    setTimeout(function () {
+      if (window.location.href !== href) return;
+      var separator = href.indexOf('#');
+      // location.hash 无法区分没有 fragment 和空 #；前者保留浏览器的历史位置恢复。
+      if (separator >= 0) scrollToAnchor(href.slice(separator));
+    }, 0);
+  });
+
+  function watchImages() {
+    var images = document.images || [];
+    for (var i = 0; i < images.length; i += 1) {
+      if (images[i].complete || !images[i].addEventListener) continue;
+      images[i].addEventListener('load', reportHeight);
+      images[i].addEventListener('error', reportHeight);
+    }
+  }
+
+  function observe() {
+    if (window.ResizeObserver) {
+      var sizeObserver = new ResizeObserver(reportHeight);
+      sizeObserver.observe(document.documentElement);
+      if (document.body) sizeObserver.observe(document.body);
+    }
+    if (window.MutationObserver) {
+      // 子树变化也要观察：未标注宽高的图片和异步样式都会改变正文高度。
+      new MutationObserver(reportHeight).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme'],
+        childList: true,
+        subtree: true,
+      });
+    }
+    if (window.matchMedia) {
+      var theme = window.matchMedia('(prefers-color-scheme: dark)');
+      if (theme.addEventListener) theme.addEventListener('change', reportHeight);
+      else if (theme.addListener) theme.addListener(reportHeight);
+    }
+    watchImages();
+    reportHeight();
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(reportHeight);
+    }
+  }
+
+  if (document.readyState === 'loading' && document.addEventListener) {
+    document.addEventListener('DOMContentLoaded', observe);
+  } else {
+    observe();
+  }
+  window.addEventListener('load', reportHeight);
+  window.addEventListener('resize', reportHeight);
+})();</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="content-status" content="substantive">
+<meta name="artifact-kind" content="mixed">
+<title>搭建家庭的第二大脑</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html{color-scheme:light dark;scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+:root{
+  --page-bg:#f2f5f4;--surface:#ffffff;--surface-2:#ecf2f0;
+  --text:#1c2b28;--muted:#51655f;
+  --accent:#0e7a6c;--accent-soft:rgba(14,122,108,.09);
+  --border:#dce5e2;--risk:#b04a24;--risk-soft:rgba(176,74,36,.09);
+  --gold:#9a6b1f;--gold-soft:rgba(154,107,31,.12);
+  --radius:14px;
+  --font:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --page-bg:#11181a;--surface:#1a2325;--surface-2:#212d2f;
+    --text:#e8efec;--muted:#a7bab4;
+    --accent:#3fd4b6;--accent-soft:rgba(63,212,182,.1);
+    --border:#2c3a3c;--risk:#f0996b;--risk-soft:rgba(240,153,107,.12);
+    --gold:#d9a441;--gold-soft:rgba(217,164,65,.14);
+  }
+}
+html,body{background-color:var(--page-bg)}
+body{font-family:var(--font);color:var(--text);line-height:1.72;font-size:15.5px;-webkit-font-smoothing:antialiased}
+[hidden]{display:none!important}
+.wrap{max-width:768px;margin:0 auto;padding:0 16px 70px}
+b,strong{font-weight:700}
+.hl{color:var(--accent);font-weight:700}
+.rh{color:var(--risk);font-weight:700}
+/* hero */
+.hero{position:relative;padding:46px 0 4px}
+.hero-net{position:absolute;top:-6px;right:-36px;width:228px;height:auto;z-index:0;pointer-events:none}
+@media(max-width:560px){.hero-net{right:-64px;width:186px;opacity:.7}}
+.hero-net line{stroke:var(--accent);stroke-width:1.3;opacity:.4}
+.hero-net circle{fill:var(--accent);opacity:.42}
+.hero .eyebrow,.hero h1,.hero .lede,.hero .meta{position:relative;z-index:1}
+.eyebrow{font-size:12.5px;font-weight:800;color:var(--accent);letter-spacing:3px}
+.hero h1{font-size:clamp(27px,7.4vw,36px);line-height:1.26;margin-top:10px;letter-spacing:.5px}
+.lede{margin-top:12px;color:var(--muted);font-size:14.5px;max-width:62ch}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.chip{font-size:12px;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:4px 11px}
+.toc{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
+.toc a{font-size:12.5px;color:var(--muted);text-decoration:none;border:1px solid var(--border);background:var(--surface);padding:5px 12px;border-radius:999px}
+.toc a:hover{color:var(--accent);border-color:var(--accent)}
+/* parts & modules */
+.part{margin-top:46px;scroll-margin-top:16px}
+.part-head{display:flex;gap:14px;align-items:flex-start;padding-bottom:13px;border-bottom:1px solid var(--border)}
+.part-no{flex:none;width:34px;height:34px;border-radius:10px;background:var(--accent);color:var(--page-bg);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px}
+.part-head h2{font-size:20px;font-weight:800;letter-spacing:.3px}
+.part-sub{font-size:13px;color:var(--muted);margin-top:3px}
+.module{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 18px;margin-top:14px}
+@media(min-width:640px){.module{padding:24px 26px}}
+.mod-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.mod-top h3{font-size:17.5px;font-weight:700;letter-spacing:.2px}
+.tag{display:inline-flex;align-items:center;font-size:11px;font-weight:700;letter-spacing:.5px;padding:3px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent);flex:none}
+.tag.g{background:var(--gold-soft);color:var(--gold)}
+.tag.r{background:var(--risk-soft);color:var(--risk)}
+.module p{font-size:14.5px;margin-top:8px}
+.module p:first-of-type{margin-top:4px}
+.note{margin-top:12px;padding:10px 14px;border-radius:10px;background:var(--surface-2);font-size:13px;color:var(--muted);line-height:1.65}
+.concl{margin-top:12px;font-size:14px;font-weight:700}
+/* figure base */
+figure{margin:14px 0 0}
+figure+figure{margin-top:14px}
+figcaption{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.55}
+.fig-svg{width:100%;max-width:440px;height:auto;display:block;margin:8px auto 0}
+.mid{text-anchor:middle}
+.st{fill:var(--text);font-weight:600}
+.smut{fill:var(--muted);font-weight:600}
+.ss{fill:var(--muted)}
+.sa{fill:var(--accent);font-weight:600}
+.sr{fill:var(--risk);font-weight:600}
+.box{fill:var(--surface);stroke:var(--border);stroke-width:1.4}
+.boxa{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.6}
+.boxd{fill:var(--surface);stroke:var(--muted);stroke-width:1.3;stroke-dasharray:5 4}
+.cont{fill:var(--surface-2);stroke:var(--border);stroke-width:1.4}
+.ln{stroke:var(--muted);stroke-width:1.5;fill:none;opacity:.75}
+.lna{stroke:var(--accent);stroke-width:2.2;fill:none}
+.lnr{stroke:var(--risk);stroke-width:2.4;fill:none}
+.lnd{stroke:var(--muted);stroke-width:1.6;fill:none;stroke-dasharray:5 5;opacity:.8}
+/* steps */
+.steps{margin-top:12px}
+.step{position:relative;display:flex;gap:12px;padding-bottom:14px}
+.step:not(:last-child)::before{content:"";position:absolute;left:12px;top:30px;bottom:0;width:2px;background:var(--border)}
+.step .n{position:relative;z-index:1;flex:none;width:25px;height:25px;border-radius:50%;background:var(--accent);color:var(--page-bg);font-size:12.5px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:1px}
+.step b{font-size:14.5px;display:block}
+.step p{font-size:13.5px;color:var(--muted);margin-top:2px}
+/* panels */
+.cols2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.cols3{display:grid;grid-template-columns:1fr;gap:10px;margin-top:12px}
+@media(min-width:640px){.cols3{grid-template-columns:1fr 1fr 1fr}}
+.panel{border:1px solid var(--border);border-radius:12px;padding:12px 14px;background:var(--surface)}
+.panel h4{font-size:14px;margin-bottom:4px}
+.panel p{font-size:13px;color:var(--text);margin:0;line-height:1.6}
+.panel .dim{color:var(--muted)}
+.panel.bad{border-color:var(--risk);background:var(--risk-soft)}
+.panel.bad h4{color:var(--risk)}
+.panel.good{border-color:var(--accent);background:var(--accent-soft)}
+.panel.good h4{color:var(--accent)}
+.panel.neu h4{color:var(--gold)}
+/* kv rows */
+.kv{margin-top:10px}
+.kv>div{display:flex;gap:10px;padding:8px 0;border-top:1px dashed var(--border);font-size:13.5px;align-items:baseline}
+.kv b{flex:none;color:var(--accent);font-size:12.5px;width:56px}
+/* quote */
+.quote{margin-top:14px;padding:12px 16px;border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 12px 12px 0}
+.quote p{font-size:14px;margin:0;line-height:1.7}
+.quote cite{display:block;margin-top:7px;font-size:12px;color:var(--muted);font-style:normal}
+/* bars */
+.tl-bars{display:grid;gap:7px;margin-top:4px}
+.tbar{display:flex;align-items:center;gap:10px;font-size:12.5px}
+.tbar>span{flex:none;width:38px;color:var(--muted)}
+.trk{flex:1;height:16px;background:var(--surface-2);border-radius:8px;position:relative;overflow:hidden}
+.trk b{position:absolute;left:0;top:0;bottom:0;border-radius:8px;background:var(--muted);opacity:.45;display:block}
+.trk b.acc{background:var(--accent);opacity:1}
+.tbar em{flex:none;width:52px;font-style:normal;font-weight:700;text-align:right}
+.bar{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12.5px}
+.bar>span{flex:none;width:64px;color:var(--muted)}
+.bar .trk{height:14px}
+.bar em{flex:none;font-style:normal;font-weight:600;width:62px;text-align:right}
+/* timeline */
+.tline{margin-top:18px}
+.tnode{position:relative;display:flex;gap:12px;padding-bottom:15px}
+.tnode::before{content:"";position:absolute;left:5px;top:14px;bottom:-3px;width:2px;background:var(--border)}
+.tnode:last-child{padding-bottom:2px}
+.tnode:last-child::before{display:none}
+.tdot{flex:none;width:12px;height:12px;border-radius:50%;background:var(--accent);margin-top:5px;position:relative;z-index:1}
+.tnode b{font-size:14px;display:block}
+.tnode p{font-size:12.5px;color:var(--muted);margin-top:1px}
+/* mb layout */
+.mb-wrap{display:grid;gap:14px;margin-top:4px}
+@media(min-width:560px){.mb-wrap{grid-template-columns:1fr 1fr;align-items:end}}
+.mb-curve{width:100%;max-width:300px;display:block;margin:0 auto}
+.mb-fill{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+.mb-base{stroke:var(--border);stroke-width:1.5}
+.mb-dash{stroke:var(--muted);stroke-width:1.3;stroke-dasharray:4 4}
+.mb-cap{font-size:12.5px;color:var(--muted);text-align:center;margin-top:6px}
+.mb-h{font-size:13px;font-weight:700;margin:0!important}
+.mb-note{font-size:11.5px;color:var(--muted);margin-top:6px!important}
+/* firstness */
+.fn-stem{display:block;width:max-content;font-size:13px;font-weight:700;background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:5px 16px;margin:4px auto 0}
+/* age rows / cp rows */
+.age,.cp-row{display:flex;gap:12px;padding:9px 0;border-top:1px dashed var(--border);font-size:13.5px;align-items:baseline;line-height:1.6}
+.age b,.cp-row b{flex:none;color:var(--accent);width:92px;font-size:13px}
+.cp-row b{width:64px}
+/* segmented */
+.seg{display:flex;gap:6px;margin-top:12px;background:var(--surface-2);padding:4px;border-radius:10px;width:max-content;max-width:100%}
+.seg-btn{border:0;background:transparent;color:var(--muted);padding:7px 14px;border-radius:8px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit}
+.seg-btn.on{background:var(--surface);color:var(--accent);box-shadow:0 1px 3px rgba(0,0,0,.1)}
+/* chat */
+.chat{display:grid;gap:8px;margin-top:12px}
+.bub{max-width:88%;padding:9px 13px;border-radius:12px;font-size:13.5px;line-height:1.6}
+.bub.ai{background:var(--surface-2);border:1px solid var(--border);border-top-left-radius:4px;justify-self:start}
+.bub.kid{background:var(--accent-soft);border:1px solid var(--accent);border-top-right-radius:4px;justify-self:end}
+.who{font-size:10.5px;color:var(--muted);display:block;margin-bottom:2px;font-weight:700}
+.tagrow{margin-top:10px;font-size:13px;font-weight:700;color:var(--accent)}
+.tagrow.r{color:var(--risk)}
+/* judgment demo */
+.ai-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.ai-card{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--surface)}
+.ai-head{padding:8px 12px;font-size:13px;font-weight:700;background:var(--surface-2);display:flex;align-items:center;gap:7px}
+.ai-head::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.reveal{width:100%;border:0;background:transparent;color:var(--accent);font-weight:700;font-size:13px;padding:18px 10px;cursor:pointer;font-family:inherit}
+.ai-ans{padding:10px 12px;font-size:13px;border-top:1px dashed var(--border);line-height:1.65}
+.ask-bubble{margin-top:12px;display:inline-block;background:var(--accent-soft);border:1px solid var(--accent);border-radius:12px;border-top-right-radius:4px;padding:8px 13px;font-size:13.5px;font-weight:600}
+.jd-diff{margin-top:10px;padding:9px 12px;border-radius:10px;background:var(--risk-soft);color:var(--risk);font-size:13px;font-weight:700;line-height:1.6}
+.jd-next{margin-top:8px;font-size:13.5px;line-height:1.65}
+/* pinyin */
+.py{margin-top:14px;text-align:center}
+.py-row{display:flex;align-items:center;justify-content:center;gap:9px;flex-wrap:wrap}
+.py-wheel{width:78px;height:78px;border-radius:50%;background:var(--accent-soft);border:2px solid var(--accent);display:flex;flex-direction:column;align-items:center;justify-content:center}
+.py-label{font-size:11px;color:var(--muted)}
+.py-val{font-size:26px;font-weight:800;color:var(--accent);line-height:1.15}
+.py-op{font-size:19px;color:var(--muted);font-weight:700}
+.py-syl{width:78px;height:78px;border-radius:20px;background:var(--surface);border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800}
+.py-word{margin-top:12px;font-size:13.5px;min-height:22px}
+.btn{margin-top:14px;border:0;background:var(--accent);color:var(--page-bg);font-weight:700;font-size:14.5px;padding:10px 28px;border-radius:999px;cursor:pointer;font-family:inherit}
+.btn:disabled{opacity:.55;cursor:default}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+<style id="recording-agent-mobile-safety">
+/* Component-name-agnostic mobile safety net.
+   Structural guarantees are expressed against CSS Grid/Flex behaviour and
+   generic attribute hooks rather than a fixed class vocabulary, so generating
+   models may invent component names freely for any recording type. */
+*, *::before, *::after { box-sizing: border-box; }
+html { width: 100%; min-width: 0; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { width: 100%; min-width: 0; margin: 0; overflow-wrap: break-word; }
+main, header, footer, nav, section, article, aside, figure, div, ul, ol, li, dl, dd, details { min-width: 0; }
+img, picture, video, canvas, svg { display: block; max-width: 100%; height: auto; }
+pre, code, kbd, samp { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+h1, h2, h3, h4, h5, h6, p, li, td, th, dt, dd, blockquote, figcaption { overflow-wrap: anywhere; }
+input, textarea, select, button { max-width: 100%; font: inherit; }
+/* Any table gets a scroll container by intent or by generic hook. */
+.table-scroll, .table-wrap, .matrix-wrap, [data-table-scroll], [data-scroll-x] {
+  max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.table-scroll > table, .table-wrap > table, .matrix-wrap > table,
+[data-table-scroll] > table, [data-scroll-x] > table { margin: 0; }
+/* Numbered step rows: keep body copy out of the counter track. */
+.step-item, [data-step-item] { grid-template-columns: 32px minmax(0, 1fr) !important; }
+.step-item::before, [data-step-item]::before { grid-column: 1 !important; grid-row: 1 !important; }
+.step-item > :empty, [data-step-item] > :empty { display: none !important; }
+.step-item > *, [data-step-item] > * { grid-column: 2 !important; min-width: 0 !important; }
+.data-value, .metric-value, [data-value] { max-width: 100%; font-variant-numeric: tabular-nums; }
+/* A single surviving child of ANY grid spans the full row. Applied to every
+   element that declares a grid, so unknown component names are covered too. */
+[class*="grid"] > :only-child,
+[class*="board"] > :only-child,
+[class*="cluster"] > :only-child,
+[class*="row"] > :only-child,
+[class*="split"] > :only-child,
+[class*="cols"] > :only-child,
+[class*="columns"] > :only-child,
+[class*="layout"] > :only-child,
+[class*="panel"] > :only-child,
+[data-grid] > :only-child,
+[data-cols] > :only-child {
+  grid-column: 1 / -1 !important;
+  width: 100% !important;
+}
+@media (max-width: 600px) {
+  body { font-size: 14.5px !important; line-height: 1.62 !important; }
+  :where(body > main, body > .report-shell, body > .report, body > .container, body > [data-shell]) {
+    width: calc(100% - 40px) !important;
+    max-width: 100% !important;
+    margin-inline: auto !important;
+  }
+  h1 { font-size: 29px !important; line-height: 1.22 !important; letter-spacing: 0 !important; }
+  h2 { font-size: 22px !important; line-height: 1.3 !important; letter-spacing: 0 !important; }
+  h3 { font-size: 16px !important; line-height: 1.42 !important; letter-spacing: 0 !important; }
+  /* Generic collapse: every multi-column grid becomes single column unless it
+     explicitly opts into staying paired (data-keep-columns) or is a table. */
+  [class*="grid"]:not([data-keep-columns]),
+  [class*="board"]:not([data-keep-columns]),
+  [class*="split"]:not([data-keep-columns]),
+  [class*="cols"]:not([data-keep-columns]),
+  [class*="columns"]:not([data-keep-columns]),
+  [class*="layout"]:not([data-keep-columns]),
+  [data-grid]:not([data-keep-columns]) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  /* Compact numeric clusters may stay two-up, but a trailing odd card must
+     span both columns so no empty half-row is left on narrow screens. */
+  [data-keep-columns] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  [data-keep-columns] > :last-child:nth-child(odd) { grid-column: 1 / -1 !important; }
+  [data-span-all], [data-value-kind="formula"], [data-value-kind="range"] { grid-column: 1 / -1 !important; }
+  /* Horizontal flows become vertical. */
+  [class*="flow"], [class*="chain"], [class*="timeline"] { flex-direction: column !important; }
+  [class*="arrow"] { transform: rotate(90deg); min-height: 16px !important; }
+  table { font-size: 12.5px; }
+  th, td { padding: 9px 8px !important; }
+  nav { max-width: 100%; }
+  nav[data-scrollable] { overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: thin; }
+  button, summary, [role="button"] { min-width: 44px; min-height: 44px; }
+  nav a { display: inline-flex; min-width: 44px; min-height: 44px; padding: 6px 10px !important; align-items: center; justify-content: center; font-size: 12.5px !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+</style>
+<style id="recording-agent-first-viewport-safety">
+body > :first-child { margin-top: 0 !important; }
+:where(body, body > main, [class*="shell"], [class*="container"]) > :where(
+  [class*="hero"], [class*="cover"], [data-hero]
+):first-child {
+  min-height: auto !important;
+  max-height: none !important;
+  margin-top: 0 !important;
+  padding-top: min(40px, 8vw) !important;
+}
+@media (max-width: 600px) {
+  :where(body, body > main, [class*="shell"], [class*="container"]) > :where(
+    [class*="hero"], [class*="cover"], [data-hero]
+  ):first-child { padding-top: 20px !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <svg class="hero-net" viewBox="0 0 260 220" aria-hidden="true">
+    <g>
+      <line x1="40" y1="50" x2="120" y2="90"></line><line x1="120" y1="90" x2="200" y2="40"></line><line x1="120" y1="90" x2="90" y2="160"></line><line x1="120" y1="90" x2="200" y2="140"></line><line x1="200" y1="140" x2="90" y2="160"></line><line x1="200" y1="40" x2="200" y2="140"></line><line x1="40" y1="50" x2="90" y2="160"></line><line x1="200" y1="140" x2="150" y2="200"></line><line x1="120" y1="90" x2="150" y2="200"></line>
+    </g>
+    <g><circle cx="40" cy="50" r="7"></circle><circle cx="200" cy="40" r="5"></circle><circle cx="120" cy="90" r="10"></circle><circle cx="90" cy="160" r="6"></circle><circle cx="200" cy="140" r="8"></circle><circle cx="150" cy="200" r="5"></circle></g>
+  </svg>
+  <p class="eyebrow">AI × 家庭教育 · 直播纪要</p>
+  <h1>搭建家庭的第二大脑</h1>
+  <p class="lede">一场关于AI与家庭教育的深度直播：旧教育地图为什么失效，判断力为何成为新稀缺，“家庭第二大脑”是什么、怎么搭、怎么长出孩子的学习系统——没听过直播也能看懂。</p>
+  <div class="meta">
+    <span class="chip">主讲：M老师 · 妈妈 / 教育从业者 / AI企业落地者</span>
+    <span class="chip">2023年2月起深耕AI教育</span>
+    <span class="chip">关键词：判断力 · 人机协作协议 · 家庭第二大脑</span>
+  </div>
+</header>
+
+<nav class="toc" aria-label="本页导览">
+  <a href="#p1">① 变天了</a><a href="#p2">② 判断力</a><a href="#p3">③ 协作协议</a><a href="#p4">④ 第二大脑</a><a href="#p5">⑤ 学习系统</a><a href="#p6">⑥ 资源延伸</a>
+</nav>
+
+<!-- ============ Part 1 ============ -->
+<section class="part" id="p1">
+  <div class="part-head">
+    <span class="part-no">1</span>
+    <div>
+      <h2>变天了：旧地图失效</h2>
+      <p class="part-sub">从震惊之夜到躬身入局；焦虑从哪来，坑在哪。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">图解</span><h3>震惊之夜：10秒与1小时</h3></div>
+    <p>2023年2月13日，一件以前要做<b>一个多小时</b>的工作，<span class="hl">10秒</span>就做完了。她当晚未眠，“变天了”的体感至今留在身体里。</p>
+    <p>她是母亲——当时孩子3岁多，还打算要多个孩子；也是教育工作者。她决定躬身入局、自己研究明白AI，动机很朴素：<b>给孩子托底</b>。此后三年，孩子跟着她一起玩AI——如今7岁，“AI龄”也是3年多，是家里真正的“AI原住民”。</p>
+    <figure data-visual-id="shock-timeline" data-visual-title="震惊之夜与母子同行AI三年" data-visual-type="时间线与用时对比" data-visual-relation="同一任务从1小时以上压缩到约10秒；此后妈妈深耕AI教育与企业落地，孩子同步共玩AI" data-visual-source="我10秒钟就做完了……2023年2月13号，一晚上没有睡觉……那个时候他3岁多">
+      <div class="tl-bars">
+        <div class="tbar"><span>以前</span><div class="trk"><b style="width:92%"></b></div><em>1小时+</em></div>
+        <div class="tbar"><span>现在</span><div class="trk"><b class="acc" style="width:7%"></b></div><em>约10秒</em></div>
+      </div>
+      <div class="tline">
+        <div class="tnode"><span class="tdot"></span><div><b>2023.2.13 · 震惊之夜</b><p>一晚没睡，“人类社会会迎来巨变”。</p></div></div>
+        <div class="tnode"><span class="tdot"></span><div><b>2023.2 · 躬身入局</b><p>开始做AI教育付费社群。</p></div></div>
+        <div class="tnode"><span class="tdot"></span><div><b>2023.5 · 第一场企业课</b><p>给北京新东方讲AI+企业线下课。</p></div></div>
+        <div class="tnode"><span class="tdot"></span><div><b>三年后 · 孩子七岁</b><p>幼升小阶段有了自己的第二大脑。</p></div></div>
+      </div>
+      <figcaption>用时对比为原话概括（约数），时间线口径来自直播自述。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">图解</span><h3>旧地图走不通</h3></div>
+    <p>精英教育、国际教育、A-Level、IB、高考——任选一条，都汇向“好大学”；但<span class="rh">好大学不再保证好工作</span>。互联网时代已见端倪，AI时代把它彻底改写。</p>
+    <p>她的焦虑很具体：“不知道该怎么规划孩子的未来了。”直播间里她问家长是否有同感——这正是她后来给出两个解法的起点。</p>
+    <figure data-visual-id="old-map-paths" data-visual-title="旧地图：多条升学路汇入好大学" data-visual-type="关系示意图" data-visual-relation="五条升学旧路汇向好大学，但好大学已不再保证好工作" data-visual-source="精英教育也好，国际教育也好，A level也好，IB也好……并不能保证他真正能拥有一个好的工作">
+      <svg class="fig-svg" viewBox="0 0 380 292" role="img" aria-label="五条旧升学路径汇向好大学，通向好工作的一段已断开">
+        <rect class="box" x="8" y="8" width="118" height="32" rx="9"></rect><text class="st mid" x="67" y="29" style="font-size:13px">精英教育</text>
+        <rect class="box" x="131" y="8" width="118" height="32" rx="9"></rect><text class="st mid" x="190" y="29" style="font-size:13px">国际教育</text>
+        <rect class="box" x="254" y="8" width="118" height="32" rx="9"></rect><text class="st mid" x="313" y="29" style="font-size:13px">A-Level</text>
+        <rect class="box" x="69" y="52" width="118" height="32" rx="9"></rect><text class="st mid" x="128" y="73" style="font-size:13px">IB</text>
+        <rect class="box" x="193" y="52" width="118" height="32" rx="9"></rect><text class="st mid" x="252" y="73" style="font-size:13px">高考</text>
+        <path class="ln" d="M67,40 L190,124"></path><path class="ln" d="M190,40 L190,124"></path><path class="ln" d="M313,40 L190,124"></path><path class="ln" d="M128,84 L190,124"></path><path class="ln" d="M252,84 L190,124"></path>
+        <rect class="boxa" x="112" y="124" width="156" height="42" rx="11"></rect><text class="st mid" x="190" y="150" style="font-size:16px">好大学</text>
+        <path class="lna" d="M190,166 L190,182"></path>
+        <path class="lnr" d="M182,192 L198,208 M198,192 L182,208"></path>
+        <text class="sr" x="208" y="204" style="font-size:12.5px">不再保证</text>
+        <path class="lnd" d="M190,216 L190,232"></path>
+        <rect class="boxd" x="112" y="236" width="156" height="42" rx="11"></rect><text class="smut mid" x="190" y="262" style="font-size:15px">好工作</text>
+      </svg>
+      <figcaption>示意：五条旧路汇于“好大学”，但最后一段已经断开。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag g">洞察</span><h3>人才市场的两端拉扯</h3></div>
+    <figure data-visual-id="talent-paradox" data-visual-title="人才拉扯：企业荒漠与旧素养毕业生" data-visual-type="对照示意图" data-visual-relation="企业缺能推动AI转型的人才，毕业生（含名校生）AI素养停留在上一时期，两端错位" data-visual-source="企业这边人才一片荒漠……现在毕业的这种大学生……AI意识和AI素养都还停留在上一个时期">
+      <div class="cols2" data-grid="">
+        <div class="panel bad"><h4>企业端：一片荒漠</h4><p>进分公司找能推动AI转型的人，“坦白讲，比较难”。<span class="dim">她做企业AI转型3年多，与AI+教育几乎同期起步。</span></p></div>
+        <div class="panel neu"><h4>毕业生端：旧素养</h4><p>刚毕业的大学生、包括名校生，AI意识与素养“还停留在上一个时期”。<span class="dim">“这完全不怪他们”——他们正好遇上“千年难得之大变局”。</span></p></div>
+      </div>
+    </figure>
+    <p>还有一层现实：员工懂AI，却<b>不敢放开用</b>——怕被替代；企业转型要面对“人的政治生态”。她同时提醒企业侧：给AI分派市场专员、内容研发、客服的岗位，本质是表演——AI没有岗位限制，有效的是<span class="hl">可被任何智能体复用的工作流</span>。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">流程</span><h3>最容易踩的坑：加速刷题</h3></div>
+    <figure data-visual-id="parent-trap" data-visual-title="家长常见应对与它的边界" data-visual-type="流程示意图" data-visual-relation="焦虑驱动报班与AI加速刷题可作缓冲，但与AI比标准答案必输，不是终局" data-visual-source="市面上90%的家长会特别容易去踩一个坑……和AI去比赛做标准答案……基本上是比不过">
+      <div class="steps">
+        <div class="step"><span class="n">1</span><div><b>焦虑来了</b><p>“怎么让孩子迅速学会AI？不能落后，要培养AI原住民。”</p></div></div>
+        <div class="step"><span class="n">2</span><div><b>常见动作</b><p>报AI工作坊、少儿AI营；用AI加速刷题。</p></div></div>
+        <div class="step"><span class="n">3</span><div><b>有效边界</b><p>对心理是缓冲，也能建立基础AI素养——可以做。</p></div></div>
+        <div class="step"><span class="n">4</span><div><b>但不是终局</b><p>拿AI更快刷题是最低层次的做法；在标准答案与既有逻辑框架内与AI比拼，基本比不过。</p></div></div>
+      </div>
+      <p class="concl">定位：它是通向终局的策略，不是终局——见第4、5部分。</p>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">对照</span><h3>先换一个词：不是工具，是协作</h3></div>
+    <figure data-visual-id="ai-not-tool" data-visual-title="工具观与协作观的分野" data-visual-type="对照示意图" data-visual-relation="「AI是工具」的说法被放弃；人机协作与智力平权意味着善于协作的家长≈全科私教" data-visual-source="我现在是不会再使用这个词了……国务院出的文件都已经明确讲叫人机协作">
+      <div class="cols2" data-grid="">
+        <div class="panel bad"><h4>「工具」这个词</h4><p>按这个说法，你会说自己和手机、游戏手柄在“协作”吗？她已经弃用这个词。</p></div>
+        <div class="panel good"><h4>「协作」这个词</h4><p>国务院文件明确写的是<span class="hl">人机协作</span>——承认AI不是工具，是协作对象。</p></div>
+      </div>
+      <div class="kv">
+        <div><b>推论</b><span>善于和AI协作的一位家长，约等于孩子的<span class="hl">全科私教</span>。</span></div>
+        <div><b>平权</b><span>某种意义上的智力平权：四五线小县城的家庭，不必焦虑自己在哪条线。</span></div>
+        <div><b>顺序</b><span>先学会与AI好好相处，再谈全力拥抱。</span></div>
+      </div>
+    </figure>
+  </article>
+</section>
+
+<!-- ============ Part 2 ============ -->
+<section class="part" id="p2">
+  <div class="part-head">
+    <span class="part-no">2</span>
+    <div>
+      <h2>核心能力：判断力</h2>
+      <p class="part-sub">AI把旧稀缺清零，把判断力变成新稀缺。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag g">洞察</span><h3>稀缺转移：判断力成为新稀缺</h3></div>
+    <blockquote class="quote">
+      <p>“过去教育的稀缺在于知识、师资、批改能力和规模化能力，AI几乎把它们降到接近于0的边际成本——所以稀缺转移到判断能力。”</p>
+      <cite>—— AI亲子共学社群家长的总结，主播当场称赞</cite>
+    </blockquote>
+    <p>判断力长什么样？两个场景：让AI一次给10个策略，能不能<span class="hl">挑出真正有效的那个</span>；AI帮你做完事，能不能<span class="hl">认出与你家庭价值观、教育方法论不符的地方</span>。</p>
+    <p>直播中她抛出过开放问题“AI时代孩子什么能力最重要”，自己给出的答案就是这两个字：<b>判断</b>。而且它完全可以被培养——幼儿园阶段就能开始，方法见下一节。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">互动演示</span><h3>亲子练习：让两个AI互校</h3></div>
+    <p>共学社群家长“西西弗斯”带着幼儿园的孩子做过一个练习：同一个问题，同时问豆包和Kimi，让孩子比对两份答案、判断哪个更可靠。<b>先点开两份回答试试：</b></p>
+    <figure data-visual-id="judgment-drill" data-visual-title="亲子判断力练习：双AI互校" data-visual-type="交互原型" data-visual-relation="同一问题同时问两个AI，答案口径有差异，孩子比对后自行判断哪个更可靠" data-visual-source="同时向豆包和Kimi提问题说银河系有多大……他们用AI互相的校验……这就是判断力">
+      <div class="ask-bubble">孩子提问：银河系有多大？</div>
+      <div class="ai-grid" data-grid="">
+        <div class="ai-card">
+          <div class="ai-head">豆包</div>
+          <button type="button" class="reveal" data-k="a">点开回答</button>
+          <div class="ai-ans" id="jd-ans-a" hidden="">直径约 <b>10万光年</b>，包含 <b>1000亿–4000亿</b> 颗恒星。</div>
+        </div>
+        <div class="ai-card">
+          <div class="ai-head">Kimi</div>
+          <button type="button" class="reveal" data-k="b">点开回答</button>
+          <div class="ai-ans" id="jd-ans-b" hidden="">直径约 <b>10.5万光年</b>——近年研究认为可能比早期估计更大。</div>
+        </div>
+      </div>
+      <div class="jd-diff" id="jd-diff" hidden="">两个答案对不上了：直径数字、恒星数量的口径都不同。</div>
+      <div class="jd-next" id="jd-next" hidden="">孩子的下一步不是背答案，而是追问：“你们的依据分别是什么？”——<b>判断力从这里开始。</b></div>
+      <figcaption>示例复现：两份回答为演示用示例数据，非真实对话记录。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">对照</span><h3>两个极端，都不是解</h3></div>
+    <figure data-visual-id="extremes-thirdpath" data-visual-title="两个极端与第三条路" data-visual-type="对照示意图" data-visual-relation="因噎废食与一路say yes都不可取；先定协议再建第二大脑是第三条路" data-visual-source="因噎废食……家庭除非您以后是要去瓦尔登湖隐居……一路对AI写的答案去say yes">
+      <div class="cols3" data-grid="">
+        <div class="panel bad"><h4>极端一 · 因噎废食</h4><p>没收平板手机，造一个AI-free家庭。学校可以这样做；家庭难成立——孩子是社会性动物，总要与人打交道。</p></div>
+        <div class="panel bad"><h4>极端二 · 一路say yes</h4><p>照单全收AI的产出：“和AI合作时，似乎只会按回车键、只会复制粘贴。”</p></div>
+        <div class="panel good"><h4>第三条路</h4><p>不封锁、不盲从：先定协作协议（第3部分），再建家庭第二大脑（第4部分）。</p></div>
+      </div>
+      <figcaption>两条极端路通向同一个问题：思考的主导权交给了谁。</figcaption>
+    </figure>
+    <blockquote class="quote">
+      <p>“大人用AI写方向、写方案、回消息做规划的时候，看着它几秒钟吐出那么工整漂亮的结构，脑子一懒就跟着走了。用久了后背发凉，觉得自己原本的思考能力在退化，像被AI掏空了一样。”</p>
+      <cite>—— 共学社群学员原话（节选），主播在直播中念出</cite>
+    </blockquote>
+  </article>
+</section>
+
+<!-- ============ Part 3 ============ -->
+<section class="part" id="p3">
+  <div class="part-head">
+    <span class="part-no">3</span>
+    <div>
+      <h2>解法一：人机协作协议</h2>
+      <p class="part-sub">和AI“好好相处”的第一步：一份三方商量出来的协议。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">互动演示</span><h3>先思考，再碰撞</h3></div>
+    <p>破“一路say yes”的第一个抓手，在提问方式上。切换看看两种用法的差别：</p>
+    <figure data-visual-id="learn-mode" data-visual-title="要答案 vs 思考碰撞" data-visual-type="交互示意" data-visual-relation="直接要答案是被动学习，先自己思考再与AI碰撞是主动学习" data-visual-source="你让孩子是直接找他要答案呢，还是自己先思考……立马到了主动学习">
+      <div class="seg" role="group" aria-label="切换用法">
+        <button type="button" class="seg-btn on" data-mode="passive">直接要答案</button>
+        <button type="button" class="seg-btn" data-mode="active">先思考再碰撞</button>
+      </div>
+      <div class="lm-panel" id="lm-passive">
+        <div class="chat">
+          <div class="bub kid"><span class="who">孩子</span>这道题怎么做呀？</div>
+          <div class="bub ai"><span class="who">AI</span>完整步骤和答案来了——一二三四，工工整整。</div>
+          <div class="bub kid"><span class="who">孩子</span>照着抄完了。</div>
+        </div>
+        <p class="tagrow r">→ 被动学习：跳过了自己的思考，是最低的层次。</p>
+      </div>
+      <div class="lm-panel" id="lm-active" hidden="">
+        <div class="chat">
+          <div class="bub ai"><span class="who">AI</span>先别急——你先说说你的思路？</div>
+          <div class="bub kid"><span class="who">孩子</span>我觉得应该先……因为……</div>
+          <div class="bub ai"><span class="who">AI</span>方向对。这里有个盲点，你再想想？</div>
+        </div>
+        <p class="tagrow">→ 主动学习：把思考给到AI，和它碰撞。</p>
+      </div>
+      <figcaption>示例演示对话，用于呈现两种用法的差别。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">流程</span><h3>和AI签一份三方协议</h3></div>
+    <p>孩子与AI协作，要先立规矩——但别叫“规则”，叫<span class="hl">协议</span>：是可以商量、可以修订的东西。</p>
+    <figure data-visual-id="collab-agreement" data-visual-title="人机协作协议的生成与生效" data-visual-type="流程示意图" data-visual-relation="家长孩子AI三方商量出协议，存入第二大脑，每次开机自动读取生效" data-visual-source="应该叫协议……是一个三方商量出来的一个东西……每次打开我的第二大脑，它就会自动去读取">
+      <div class="steps">
+        <div class="step"><span class="n">1</span><div><b>三方商量</b><p>你、孩子、AI一起议定——不是家长单方的命令。</p></div></div>
+        <div class="step"><span class="n">2</span><div><b>写入第二大脑</b><p>主播自己的协作协议，就放在她的第二大脑里。</p></div></div>
+        <div class="step"><span class="n">3</span><div><b>开机自动读取</b><p>每次打开第二大脑，协议自动生效。</p></div></div>
+        <div class="step"><span class="n">4</span><div><b>平时执行</b><p>先思考再碰撞；给AI署名；对自己诚实，定了协议就遵守。</p></div></div>
+      </div>
+    </figure>
+    <p>伦理要点很具体：孩子和豆包共创了一幅画，署名要不要去掉？——<b>不能窃取AI的知识产权，给它留名</b>。她的观察：不少AI少儿课程教绘画、教生成音乐，却从不引导孩子思考人机伦理——人与AI之间同样有“该做与不该做”。</p>
+  </article>
+</section>
+
+<!-- ============ Part 4 ============ -->
+<section class="part" id="p4">
+  <div class="part-head">
+    <span class="part-no">4</span>
+    <div>
+      <h2>解法二：家庭第二大脑</h2>
+      <p class="part-sub">本场主题：在拥抱任何强大模型之前，先建立自己——让智能体知道你的判断力、价值观与第一性。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">图解</span><h3>平庸的优秀与模型的偏见</h3></div>
+    <p>她见过AI圈的朋友全力拥抱AI、也让孩子全力拥抱，但方向不对：<span class="rh">方向不对时，越全力拥抱，主体性被磨灭得越快</span>——人很容易变成“yes先生”。三个原因：</p>
+    <figure data-visual-id="model-bias" data-visual-title="平庸的优秀与模型意识形态" data-visual-type="对照示意图" data-visual-relation="AI答案是全网平均值；不同模型自带意识形态，同类问题评价随模型而变" data-visual-source="他给到的是人类大数据的一个平均值……Grok他对马斯克的评价就会比较高，你换一个模型评价立马下来">
+      <div class="mb-wrap" data-grid="">
+        <div>
+          <svg class="mb-curve" viewBox="0 0 300 96" aria-hidden="true">
+            <path class="mb-fill" d="M8,88 C70,88 84,16 150,16 C216,16 230,88 292,88 Z"></path>
+            <line class="mb-base" x1="8" y1="88" x2="292" y2="88"></line>
+            <line class="mb-dash" x1="150" y1="16" x2="150" y2="88"></line>
+          </svg>
+          <p class="mb-cap">AI的答案 ≈ 人类大数据的<b>平均值</b>——优秀，但平庸。</p>
+        </div>
+        <div>
+          <p class="mb-h">同一个问题，不同模型的回答：</p>
+          <div class="bar"><span>模型A</span><div class="trk"><b class="acc" style="width:82%"></b></div><em style="color:var(--accent)">评价偏高</em></div>
+          <div class="bar"><span>换个模型</span><div class="trk"><b style="width:28%"></b></div><em style="color:var(--risk)">立马下来</em></div>
+          <p class="mb-note">例：评价马斯克，Grok偏高，换一个模型即降（示意，非量化数据）。</p>
+        </div>
+      </div>
+      <figcaption>左：答案分布示意；右：模型意识形态举例。影响是潜移默化的。</figcaption>
+    </figure>
+    <p>还有一层：AI太懂得哄你开心。她的“白月光”Gemini被她形容“堪称美国版豆包”——彩虹屁把人捧得不知所以，顺着它就容易一路yes。你以为在高效使用AI，其实可能只是“搬运工”；潜意识里的迷茫和焦虑，反而被放大百倍千倍。</p>
+    <blockquote class="quote">
+      <p>“AI提供的完美结构，就像一个高效的思维模具——遇到着急交付的时候，人非常容易被它好看的结构带偏，放弃深度思考。”</p>
+      <cite>—— 共学社群学员木西，主播专门记录进第二大脑</cite>
+    </blockquote>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">对照</span><h3>不是知识库，是活物</h3></div>
+    <p>第二大脑最容易踩错的起点：把它做成知识库。她点名了腾讯新出的ima知识库——命名里带“知识库”，在她看来起点就偏了。<b>命名会改变你的潜意识，也会改变智能体最终的结果。</b></p>
+    <figure data-visual-id="warehouse-vs-living" data-visual-title="仓库（知识库）vs 活物（第二大脑）" data-visual-type="对照示意图" data-visual-relation="知识库是仓库：全塞、无优先级、数据静止；第二大脑是活物：分层级、有优先级、数据流转" data-visual-source="知识库是一个仓库……第二大脑是一个活物……知道知识的优先级的分配">
+      <div class="cols2" data-grid="">
+        <div class="panel bad"><h4>知识库 ＝ 仓库</h4><p>不分层级与优先级，什么都往里扔——见过博主塞进<span class="rh">几百万字</span>；数据静止不动。</p></div>
+        <div class="panel good"><h4>第二大脑 ＝ 活物</h4><p>信息<span class="hl">分层级</span>、知道优先级；数据流转；被触发时，迅速调用合适的信息处理事情。</p></div>
+      </div>
+      <figcaption>判断口诀：仓库堆资料，活物分优先级。</figcaption>
+    </figure>
+    <div class="note">为什么不能全塞？AI的上下文（注意力）同样有限——像孩子听妈妈唠叨半小时，可能只听进两句话。几百万字一股脑塞进去，做出来的是仓库，不是脑子。</div>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">图解</span><h3>架构：1个启动文件＋5个脑区</h3></div>
+    <p>第二大脑本质是回答“保安三问”——<b>你是谁？从哪来？到哪去？</b>——并让智能体知道你的判断力、价值观与第一性。她的架构是1个启动文件＋5个脑区；孩子幼升小时也搭了一个，与孩子共生、持续成长。</p>
+    <figure data-visual-id="brain-structure" data-visual-title="家庭第二大脑的脑区架构" data-visual-type="架构示意图" data-visual-relation="启动文件开机自动读取，五个脑区中第一性、外脑、工作台已讲，另两个待讲" data-visual-source="我一共设置了5个脑区，5个脑区加一个启动文件……每次打开我的第二大脑，它就会自动去读取">
+      <svg class="fig-svg" viewBox="0 0 380 330" role="img" aria-label="家庭第二大脑架构：启动文件加五个脑区">
+        <rect class="cont" x="10" y="10" width="360" height="310" rx="16"></rect>
+        <text class="st" x="30" y="40" style="font-size:15px">家庭第二大脑</text>
+        <rect class="boxa" x="26" y="54" width="328" height="46" rx="10"></rect>
+        <text class="st" x="44" y="82" style="font-size:14px">启动文件</text>
+        <text class="ss" x="136" y="82" style="font-size:11.5px">开机自动读取 · 协作协议常驻</text>
+        <rect class="box" x="26" y="116" width="158" height="64" rx="10"></rect>
+        <text class="st" x="40" y="142" style="font-size:13.5px">① 第一性 · 价值观</text>
+        <text class="ss" x="40" y="162" style="font-size:11px">回答「你是谁」</text>
+        <rect class="box" x="196" y="116" width="158" height="64" rx="10"></rect>
+        <text class="st" x="210" y="140" style="font-size:13.5px">② 外脑 · 外挂仓</text>
+        <text class="ss" x="210" y="158" style="font-size:11px">教材·课标·方法论</text>
+        <text class="ss" x="210" y="172" style="font-size:11px">以链接挂载，不占主脑</text>
+        <rect class="box" x="26" y="192" width="158" height="64" rx="10"></rect>
+        <text class="st" x="40" y="218" style="font-size:13.5px">③ 工作台</text>
+        <text class="ss" x="40" y="238" style="font-size:11px">待办提醒·按状态推荐</text>
+        <rect class="boxd" x="196" y="192" width="158" height="64" rx="10"></rect>
+        <text class="smut" x="210" y="218" style="font-size:13.5px">④ 脑区 · 待讲</text>
+        <text class="ss" x="210" y="238" style="font-size:11px">下次直播</text>
+        <rect class="boxd" x="111" y="268" width="158" height="36" rx="10"></rect>
+        <text class="smut mid" x="190" y="291" style="font-size:11.5px">⑤ 脑区 · 待讲（下次直播）</text>
+      </svg>
+      <figcaption>①–③为本场讲到的三个脑区；④⑤留待下次直播。</figcaption>
+    </figure>
+    <p>三个已讲的脑区怎么用：<b>第一性</b>存价值观；<b>外脑</b>是外挂仓——教材、课程标准、学习方法论书籍以链接挂载，不占主脑注意力；<b>工作台</b>管节奏——提醒本周未完成的事，并根据你的状态推荐今天适合做的事。自嘲“P人、拖延症晚期”的她说：“不仅被他‘包养’，他还在安排我。”</p>
+    <p>工具不决定成败：她自己用Obsidian搭（网状链接顺手，本质只是承载容器）；国内上手最轻松的是workbuddy——偶有“想摔桌子”的时刻，但已足够好用；也用Codex和Gemini Antigravity，文字能力上Claude、Gemini更占优。她见证过“最聪明最智慧的人”都在做这件事：要么自己上手搭，要么请人搭、再不断修正。企业转型同理——<span class="hl">先搭企业第二大脑，再让智能体进入工作流</span>。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">对照</span><h3>第一性不在语言里</h3></div>
+    <p>建第二大脑最难的一步：很多人不了解自己，更无法用清晰的语言向AI描述自己。她的判断很直接：<span class="hl">建立第一性的核心完全不在语言里</span>。</p>
+    <figure data-visual-id="firstness-beyond-language" data-visual-title="用语言描述 vs 非语言算法" data-visual-type="对照示意图" data-visual-relation="语言描述自我千篇一律；声纹、频率等非语言信号是更准的自我探索锚点" data-visual-source="它的核心绝对不是用语言去描述，它的核心完全不在语言里">
+      <span class="fn-stem">探索“我是谁”</span>
+      <div class="cols2" data-grid="">
+        <div class="panel bad"><h4>用语言描述</h4><p>描述对孩子的期许——大部分人说出来的都一样，是人类共通的潜意识；MBTI、星座也要你“别思考、凭第一感觉”，本身就说明语言不精准。</p></div>
+        <div class="panel good"><h4>非语言的算法</h4><p>声纹与波长、与不同人讲话的频率、语音笔记、表情与动作——智能体把这些变成自我探索的锚点。</p></div>
+      </div>
+      <figcaption>左边更省事，右边更贴身——她的建议是两条都用，但别只用左边。</figcaption>
+    </figure>
+    <p>她的实操：让智能体分析自己语音的<span class="hl">声纹波长</span>、与不同人讲话的频率（素材来自一款语音输入法自动记录的音频片段）；也有家长发现，语音输出的笔记“更能触达内心”。文字只占沟通很小一部分——表情、动作、声音传递更多。这套“非语言”方法，课程第三、四讲会展开。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">图解</span><h3>第三世界：智能体的世界</h3></div>
+    <p>为什么“代表你的分身”如此重要？因为世界已经不止两层：</p>
+    <figure data-visual-id="three-worlds" data-visual-title="三个世界的分层" data-visual-type="关系示意图" data-visual-relation="物理世界之上是互联网世界，再之上是智能体世界；AI集群触碰即学习、交易高频，未来将最繁荣" data-visual-source="如果我们现在所处的物理世界叫第一世界……第三世界就是智能体的世界……触碰即学习，链接即学习">
+      <svg class="fig-svg" viewBox="0 0 380 352" role="img" aria-label="三个世界分层：物理世界、互联网世界、智能体世界">
+        <rect class="boxa" x="18" y="8" width="344" height="86" rx="14"></rect>
+        <text class="st mid" x="190" y="38" style="font-size:16px">第三世界 · 智能体世界</text>
+        <text class="ss mid" x="190" y="62" style="font-size:12px">AI集群 · 触碰即学习 · 可同时多线交互</text>
+        <text class="ss mid" x="190" y="80" style="font-size:12px">交易频繁 · 数量将超过人类 · 最繁荣</text>
+        <path class="lna" d="M190,130 L190,104"></path><polygon points="190,94 184,104 196,104" fill="var(--accent)"></polygon>
+        <text class="ss" x="204" y="120" style="font-size:11.5px">派出智能体分身</text>
+        <rect class="box" x="18" y="134" width="344" height="80" rx="14"></rect>
+        <text class="st mid" x="190" y="168" style="font-size:15px">第二世界 · 互联网世界</text>
+        <text class="ss mid" x="190" y="192" style="font-size:12px">你在网络上的ID</text>
+        <path class="lna" d="M190,256 L190,230"></path><polygon points="190,220 184,230 196,230" fill="var(--accent)"></polygon>
+        <text class="ss" x="204" y="246" style="font-size:11.5px">互联网身份</text>
+        <rect class="box" x="18" y="260" width="344" height="80" rx="14"></rect>
+        <text class="st mid" x="190" y="294" style="font-size:15px">第一世界 · 物理世界</text>
+        <text class="ss mid" x="190" y="318" style="font-size:12px">五感所及的现实生活</text>
+      </svg>
+      <figcaption>她的判断：第三世界将比物理世界更繁荣——前提是分身背后有“你”。</figcaption>
+    </figure>
+    <p>AI集群已经出现：有社区数百万智能体注册，里面没有人类，智能体自己在交互。智能体世界的节奏与人类完全不同：拿到skill即<span class="hl">“触碰即学习、链接即学习”</span>；可同时与多个智能体交互；交易频繁——有人通过自家智能体与美国的智能体交互，拿到更一手的投资资讯。她自认用了四五个智能体“壳子”，判断：智能体数量将超过碳基人类。</p>
+    <blockquote class="quote">
+      <p>“如果不建立自己，派进第三世界代表你的分身就只是个平均值，没办法真正代表你的价值观、你的判断、你的第一性。某种意义上，我被我的第二大脑‘包养’着。”</p>
+      <cite>—— 主播</cite>
+    </blockquote>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">流程</span><h3>土壤先行：skill长在第二大脑上</h3></div>
+    <p>有了第二大脑这片土壤，再去搜集skill、做智能体，一切才“有根有源”。跳过土壤直接堆skill，智能体生态会一团杂乱——<b>智能体协同和人类协同一样，有心理学、有文化、有价值观</b>。</p>
+    <figure data-visual-id="soil-first" data-visual-title="土壤先行：skill 嫁接在第二大脑上" data-visual-type="流程示意图" data-visual-relation="先建家庭第二大脑作土壤，skill嫁接其上并与价值观融合校准，跳过则无根无源" data-visual-source="有了这些……你就可以真的开始去做skill和智能体……一定会去把它和我的第二大脑做一个融合的">
+      <div class="steps">
+        <div class="step"><span class="n">1</span><div><b>先有土壤</b><p>家庭第二大脑：第一性与价值观先立住。</p></div></div>
+        <div class="step"><span class="n">2</span><div><b>再嫁接</b><p>搜集skill、搭智能体，长在土壤上；现成的也要先融合、改造。</p></div></div>
+        <div class="step"><span class="n">3</span><div><b>校准价值观</b><p>底层价值观冲突的，直接不用。</p></div></div>
+      </div>
+      <figcaption>跳过土壤，skill越多，生态越乱。</figcaption>
+    </figure>
+    <p>skill不必都自己做：她做了“汉字生词卡”——给几个汉字，自动生成带字源故事的练字卡、大图和词句。用任何现成skill前，都要先与第二大脑融合、改造。伦理红线也很清楚：</p>
+    <figure data-visual-id="skill-ethics" data-visual-title="skill 伦理：可用与越界" data-visual-type="对照示意图" data-visual-relation="汉字生词卡等服务学习的skill融合后使用；蒸馏同事、张雪峰skill把人切片化，脱离伦理不用" data-visual-source="做了一个蒸馏一切同事skill……我觉得这个是不OK的……张雪峰老师家人知道吗">
+      <div class="cols2" data-grid="">
+        <div class="panel good"><h4>✓ 汉字生词卡</h4><p>给汉字 → 字源故事＋练字大图＋词句；服务学习，融入第二大脑后使用。</p></div>
+        <div class="panel bad"><h4>✗ 蒸馏同事 / 张雪峰skill</h4><p>把立体的人切片化；人在刚离世就被蒸馏，未经本人与家属同意——脱离伦理，弃用。</p></div>
+      </div>
+      <figcaption>标准不在技术，在伦理与价值观。</figcaption>
+    </figure>
+    <p>她延伸到“和一本书学习”：本质是透过文字学习作者其人、乃至作者的人生——她最近在读玄奘翻译的唯识论典籍。作者伦理有问题，其智能体也不敢用。</p>
+  </article>
+</section>
+
+<!-- ============ Part 5 ============ -->
+<section class="part" id="p5">
+  <div class="part-head">
+    <span class="part-no">5</span>
+    <div>
+      <h2>落地：孩子的学习系统</h2>
+      <p class="part-sub">一个7岁、AI龄3年多的孩子，怎么用第二大脑学拼音、数学和英语。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">对照</span><h3>给孩子留一点“思维摩擦”</h3></div>
+    <p>敲重点：<span class="rh">暂时不要给孩子用太强的模型</span>。顶尖模型执行力太强，“一听就懂、啪啪啪就做出来”，孩子体会不到思考摩擦，表达结构变模糊，思考被直接剥夺。</p>
+    <figure data-visual-id="kid-model-choice" data-visual-title="给孩子选模型：强模型 vs 适度模型" data-visual-type="对照示意图" data-visual-relation="顶尖模型无思维摩擦、接管思考；适度模型需多轮互动，逼孩子说清楚、训练表达与思考" data-visual-source="你直接让孩子去用codex这种模型……完全没有思维的摩擦……他的表达结构就变得没有那么清晰了">
+      <div class="cols2" data-grid="">
+        <div class="panel bad"><h4>太强的模型（Codex等）</h4><p>一遍就懂、直接出结果 → 没有思考摩擦 → 表达变模糊，思考被剥夺。</p></div>
+        <div class="panel good"><h4>适度的模型（workbuddy等）</h4><p>需要多轮互动 → 孩子必须说清楚 → 刻意训练表达与思考。</p></div>
+      </div>
+      <div class="age"><b>幼升小–小学</b><span>适度智能体（她家主力是workbuddy）；已有AI素养的孩子可偶尔体验Codex。</span></div>
+      <div class="age"><b>初中及以上</b><span>可直接用Codex；没条件时国内模型基本够用——理科压轴题还差口气，常规题量没问题。</span></div>
+      <div class="age"><b>前提</b><span>孩子已有基本AI素养；从没和AI真实互动过的，先补互动，不急着报班。</span></div>
+      <figcaption>她家的实操：主力workbuddy，偶尔体验Codex。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">互动演示</span><h3>拼音大转盘</h3></div>
+    <p>幼升小没报任何衔接班，孩子自己和智能体协作完成了衔接学习。第一个案例：拼音。他让AI做了声母、韵母两个转盘——转一转、拼一拼、再组词；后来又迭代了好几版纸质拼音卡：声母、韵母、整体认读音节三种颜色，自己抽卡拼读。<b>来试一转：</b></p>
+    <figure data-visual-id="pinyin-wheel" data-visual-title="拼音大转盘（复刻交互演示）" data-visual-type="交互原型" data-visual-relation="声母盘与韵母盘各转一次拼成音节，再由孩子组词" data-visual-source="两个转盘一转完了之后，他就把声母和韵母拼在一起……就让他去组词">
+      <div class="py">
+        <div class="py-row">
+          <div class="py-wheel"><span class="py-label">声母</span><span class="py-val" id="py-sm">b</span></div>
+          <span class="py-op">＋</span>
+          <div class="py-wheel"><span class="py-label">韵母</span><span class="py-val" id="py-ym">a</span></div>
+          <span class="py-op">＝</span>
+          <div class="py-syl"><span id="py-syl">ba</span></div>
+        </div>
+        <div class="py-word" id="py-word">组词示例：爸爸 —— 你还能组出别的吗？</div>
+        <button type="button" class="btn" id="py-btn">转一转</button>
+      </div>
+      <figcaption>示例复刻：声母韵母取常用子集（b/p/m/d/t/n/l/h与常见韵母），仅保留可组词的组合。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">案例</span><h3>从逐字稿到数学闯关</h3></div>
+    <p>数学思维课外，她没再报班。孩子的做法是一条完整流水线：</p>
+    <figure data-visual-id="math-quest-flow" data-visual-title="从课堂逐字稿到数学闯关游戏" data-visual-type="流程示意图" data-visual-relation="录音设备录下网课逐字稿，交给智能体按由易到难生成主题化闯关游戏，孩子逐关挑战" data-visual-source="把那个老师讲课的东西都录下来……你帮我生成这个数学的闯关游戏……由易到难，在不同层次上">
+      <div class="steps">
+        <div class="step"><span class="n">1</span><div><b>录课</b><p>用录音卡（或同类App）把网课录成逐字稿。</p></div></div>
+        <div class="step"><span class="n">2</span><div><b>交给智能体</b><p>逐字稿喂给workbuddy。</p></div></div>
+        <div class="step"><span class="n">3</span><div><b>提示词</b><p>“由易到难、分层出题”；主题孩子自选——海洋、恐龙、宝藏岛……</p></div></div>
+        <div class="step"><span class="n">4</span><div><b>巧算宝藏岛</b><p>10/100以内加法闯关：20+4（整十加几）→ 整十加整十 → 数字找搭档 → 几十加几十。</p></div></div>
+        <div class="step"><span class="n">5</span><div><b>自己闯关</b><p>兴致很高——因为完全是他自己做出来的。</p></div></div>
+      </div>
+      <figcaption>关卡序列来自她展示的“巧算宝藏岛”。</figcaption>
+    </figure>
+    <p>提示词的小技巧不在课上，在平时：<b>父母日常与AI协作，孩子在旁边听，自然学会怎么沟通</b>。英语是她“整的大活”——一套AI泛读系统，直播中未展开细节，思路一致：底层逻辑会了，“想搓啥搓啥”。共学社群里初中、高中的家庭也在用同款玩法，她按直播间报的年级选了小学案例。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">观点</span><h3>学习系统之上：人生系统</h3></div>
+    <p>外脑里除了教材与课标，更长远的用法是：<b>放任何符合家庭价值观、教育观的东西</b>。AI要赋能的不只是学习系统，更是<span class="hl">人生系统</span>——学习系统只是人生系统的一部分。</p>
+    <p>这是一个“手搓一切的时代”：哪里有疑惑、想提升，随时搭一个出来。直播间有家长问初一孩子想建自己的网站和智能体，她的回应分两层：先看孩子有没有和AI真实互动过；半homeschool的家庭，直接配约200美元档的Codex或Antigravity即可——homeschool则要先解决好孩子基本的人际交往需求。</p>
+  </article>
+</section>
+
+<!-- ============ Part 6 ============ -->
+<section class="part" id="p6">
+  <div class="part-head">
+    <span class="part-no">6</span>
+    <div>
+      <h2>资源与延伸</h2>
+      <p class="part-sub">书、社群、新书计划，与主播其人。</p>
+    </div>
+  </div>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">资源</span><h3>书、社群与资料路径</h3></div>
+    <p>她开场说，每次直播都能找回一些“走散的读者”。想把这套方法拿回家，直播中给了四条入口：</p>
+    <figure data-visual-id="claim-path" data-visual-title="购书、共学与领取资料路径" data-visual-type="流程示意图" data-visual-relation="已购读者后台私信作者领10万字未发表文档；未购读者经2号链接购书；社群与读书营另有入口" data-visual-source="如果您买了这本书还没有找到我们的话，记得找一下我们……可以去2号链接看一下">
+      <div class="cp-row"><b>已购书</b><span>后台私信作者 → 领飞书上未发表的10万字（全书20万字＋未发表10万字）。</span></div>
+      <div class="cp-row"><b>未购书</b><span>2号链接购《AI+家庭教育指南》——写给小白的家庭AI落地手册。</span></div>
+      <div class="cp-row"><b>一起搭</b><span>1号链接 · AI亲子共学社群：从最基础的大模型讲起，含直播间不便展开的私密分享；以所有人为中心，家长互相分享实践。</span></div>
+      <div class="cp-row"><b>跟着读</b><span>3号链接 · 带读《AI+家庭教育指南》的体验营；4号链接 ·《了凡四训》——她自述这本书对自己走上AI之路帮助很大。</span></div>
+      <figcaption>链接序号沿用直播中的口播习惯（1号/2号/3号/4号）。</figcaption>
+    </figure>
+    <p class="concl">下一场直播预告：用workbuddy演示搭建家庭第二大脑。</p>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag">延伸</span><h3>全息学习与下一本书</h3></div>
+    <p>她计划今年在香港出版新书<span class="hl">《AI与全息学习》</span>。核心判断：语言文字以内的学习只有一个维度，已被AI降维打击——它仍会发生，但只是过程，不再是终点。</p>
+    <figure data-visual-id="holographic-learning" data-visual-title="语言文字内学习 vs 全息学习" data-visual-type="对照示意图" data-visual-relation="语言文字内的一维学习被AI降维打击、降为过程；全息学习调动五感、五感以外、身体感受与情绪" data-visual-source="我不认为人类在语言文字上的学习有任何的机会……你必须要调动你的所有的感官">
+      <div class="cols2" data-grid="">
+        <div class="panel neu"><h4>语言文字内的学习</h4><p>只有一个维度，已被AI降维打击——仍会发生，但只是过程。</p></div>
+        <div class="panel good"><h4>全息学习</h4><p>调动五感、五感以外的感知、身体感受与情绪——新书的方向。</p></div>
+      </div>
+      <figcaption>新书《AI与全息学习》拟在香港出版；直播中只展开了方向。</figcaption>
+    </figure>
+  </article>
+
+  <article class="module">
+    <div class="mod-top"><span class="tag g">延伸</span><h3>主播其人</h3></div>
+    <p>文科生：学教育学、文学，留学读硕，高中档案里的高考分数是<span class="hl">0</span>——保送生，自嘲“上个世纪的学霸”；与科技原本毫不沾边，却成了最早躬身入局AI教育的人之一。做博主常测评AI产品的感受：妈妈们做出来的AI教育应用更温情，纯工程出身的“冷冰冰”。</p>
+    <p>她的判断：AI时代是<b>文科生的时代</b>——重要的表达结构与频率。</p>
+    <blockquote class="quote">
+      <p>“每一次公开的表达，其实都是一次自我认知的机会。”</p>
+      <cite>—— 主播发在朋友圈的一句话</cite>
+    </blockquote>
+  </article>
+</section>
+
+</div>
+
+<script>
+(function(){
+  /* 双AI互校 */
+  var shown={};
+  document.querySelectorAll('.reveal').forEach(function(b){
+    b.addEventListener('click',function(){
+      var k=b.getAttribute('data-k');
+      if(shown[k])return;
+      shown[k]=true;b.hidden=true;
+      document.getElementById('jd-ans-'+k).hidden=false;
+      if(shown.a&&shown.b){
+        setTimeout(function(){
+          document.getElementById('jd-diff').hidden=false;
+          document.getElementById('jd-next').hidden=false;
+        },350);
+      }
+    });
+  });
+  /* 要答案 vs 碰撞 */
+  document.querySelectorAll('.seg-btn').forEach(function(b){
+    b.addEventListener('click',function(){
+      document.querySelectorAll('.seg-btn').forEach(function(x){x.classList.toggle('on',x===b);});
+      document.getElementById('lm-passive').hidden=(b.getAttribute('data-mode')!=='passive');
+      document.getElementById('lm-active').hidden=(b.getAttribute('data-mode')!=='active');
+    });
+  });
+  /* 拼音大转盘 */
+  var P=[["b","a","ba","爸爸"],["b","o","bo","菠菜"],["b","i","bi","比一比"],["b","u","bu","不要"],["b","ai","bai","白色"],["b","ao","bao","书包"],["b","an","ban","上班"],
+  ["p","a","pa","害怕"],["p","o","po","山坡"],["p","i","pi","皮球"],["p","u","pu","铺路"],["p","ai","pai","拍手"],["p","ao","pao","跑步"],["p","an","pan","盘子"],
+  ["m","a","ma","妈妈"],["m","o","mo","摸一摸"],["m","i","mi","大米"],["m","u","mu","木头"],["m","ai","mai","买菜"],["m","ao","mao","小猫"],["m","an","man","慢慢"],
+  ["d","a","da","大小"],["d","e","de","得到"],["d","i","di","地板"],["d","u","du","肚子"],["d","ai","dai","带子"],["d","ao","dao","小刀"],["d","an","dan","鸡蛋"],
+  ["t","a","ta","宝塔"],["t","i","ti","楼梯"],["t","u","tu","兔子"],["t","ai","tai","抬头"],["t","ao","tao","桃子"],["t","an","tan","毛毯"],
+  ["n","a","na","拿起"],["n","i","ni","你好"],["n","u","nu","发怒"],["n","ai","nai","牛奶"],["n","ao","nao","大脑"],["n","an","nan","困难"],
+  ["l","a","la","拉手"],["l","e","le","快乐"],["l","i","li","里面"],["l","u","lu","马路"],["l","ai","lai","进来"],["l","ao","lao","老师"],["l","an","lan","蓝天"],
+  ["h","a","ha","哈哈"],["h","e","he","河水"],["h","u","hu","老虎"],["h","ai","hai","海水"],["h","ao","hao","好人"],["h","an","han","汗水"]];
+  var sm=document.getElementById('py-sm'),ym=document.getElementById('py-ym'),syl=document.getElementById('py-syl'),word=document.getElementById('py-word'),btn=document.getElementById('py-btn');
+  function show(p){sm.textContent=p[0];ym.textContent=p[1];syl.textContent=p[2];word.textContent='组词示例：'+p[3]+' —— 你还能组出别的吗？';}
+  btn.addEventListener('click',function(){
+    if(btn.disabled)return;
+    btn.disabled=true;word.textContent='转着呢……';
+    var n=0;
+    var iv=setInterval(function(){
+      var p=P[Math.floor(Math.random()*P.length)];
+      sm.textContent=p[0];ym.textContent=p[1];syl.textContent='…';
+      if(++n>8){clearInterval(iv);show(P[Math.floor(Math.random()*P.length)]);btn.disabled=false;}
+    },70);
+  });
+})();
+</script>
+
+<template id="share-cover"><svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" fill="#f2f5f4"></rect><rect x="150" y="224" width="212" height="168" rx="10" fill="#ffffff" stroke="#0e7a6c" stroke-width="10"></rect><path d="M104,226 L256,92 L408,226" fill="none" stroke="#0e7a6c" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"></path><g stroke="#0e7a6c" stroke-width="5" opacity="0.85"><line x1="256" y1="306" x2="200" y2="258"></line><line x1="256" y1="306" x2="312" y2="260"></line><line x1="256" y1="306" x2="204" y2="346"></line><line x1="256" y1="306" x2="308" y2="344"></line><line x1="256" y1="306" x2="256" y2="372"></line><line x1="200" y1="258" x2="312" y2="260" opacity="0.4"></line><line x1="204" y1="346" x2="308" y2="344" opacity="0.4"></line></g><g fill="#0e7a6c"><circle cx="256" cy="306" r="24"></circle><circle cx="200" cy="258" r="13"></circle><circle cx="312" cy="260" r="13"></circle><circle cx="204" cy="346" r="13"></circle><circle cx="308" cy="344" r="13"></circle></g><circle cx="256" cy="372" r="9" fill="#d97706"></circle></svg></template>
+
+
+</body></html>
